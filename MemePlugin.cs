@@ -1,0 +1,520 @@
+using ShiroBot.Meme.Contracts;
+using ShiroBot.MemePlugin.Config;
+using ShiroBot.MemePlugin.Meme;
+using ShiroBot.SDK.Abstractions;
+using ShiroBot.SDK.Core;
+using ShiroBot.SDK.Models;
+using ShiroBot.SDK.Plugin;
+
+[assembly: ShiroBotPackage("shirobot.plugin.meme", ShiroBotPackageKind.Plugin, "1.0.0")]
+[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
+
+namespace ShiroBot.MemePlugin;
+
+[BotPlugin(
+    "MemePlugin",
+    Name = "表情包插件",
+    Version = "1.0.0",
+    Description = "本地表情库、群聊盗图采集、QQ 商城表情降级发送，并向其他插件提供表情服务。",
+    Author = "ShirokaProject",
+    Category = PluginCategory.Media,
+    IsPluginSingleFile = true,
+    SharedAssemblies = "ShiroBot.Model.QQ;ShiroBot.Meme.Contracts")]
+public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
+{
+    private const string CommandPrefix = "#meme";
+    private const string DefaultConfig = """
+        [meme]
+        enabled = true
+        auto_collect = "sticker"
+        collect_groups = []
+        collect_direct = false
+        max_bytes = 5000000
+        max_items = 5000
+        max_total_bytes = 500000000
+        cooldown_seconds = 45
+        max_per_hour = 10
+        send_with_mention = true
+        send_with_quote = false
+        send_mode = "auto"
+        caption_max_chars = 120
+        download_timeout_seconds = 15
+        library_dir = "memes"
+
+        [network]
+        http_proxy = ""
+        """;
+
+    private MemeConfig _config = new();
+    private MemeStore? _store;
+    private MemeDownloader? _downloader;
+    private MemeIngestQueue? _queue;
+    private MemeSender? _sender;
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
+
+    protected override Task OnConfigLoadedAsync(MemeConfig config, CancellationToken cancellationToken)
+    {
+        _config = config;
+        return Task.CompletedTask;
+    }
+
+    protected override Task OnConfigChangedAsync(MemeConfig previous, MemeConfig current, CancellationToken cancellationToken)
+    {
+        _config = current;
+        _store?.UpdateConfig(current.Meme);
+        if (_sender is not null && Context is not null)
+            _sender = new MemeSender(Context, current.Meme);
+        return Task.CompletedTask;
+    }
+
+    protected override void ConfigureRoutes()
+    {
+        GroupCommands.MapPrefix(CommandPrefix, HandleMemeCommandAsync);
+        DirectCommands.MapPrefix(CommandPrefix, HandleMemeCommandAsync);
+
+        // 观察者路由：不标记 handled，因此不会阻断 AI 聊天等优先级更高的插件。
+        Events.Map<MessageEvent>(HandleMessageAsync);
+    }
+
+    protected override async Task LoadAsync()
+    {
+        await EnsureConfigTemplateAsync().ConfigureAwait(false);
+
+        var root = Path.Combine(Context.PluginDirectory, _config.Meme.LibraryDir);
+        _store = new MemeStore(root, _config.Meme);
+        await _store.LoadAsync().ConfigureAwait(false);
+
+        _downloader = new MemeDownloader(_config.Meme, _config.Network);
+        _queue = new MemeIngestQueue(_store, _downloader);
+        _sender = new MemeSender(Context, _config.Meme);
+
+        Context.Services.RegisterSingleton<IMemeService>(this);
+        BotLog.Info($"MemePlugin 已加载，表情库：{root}");
+    }
+
+    protected override async Task OnUnloadAsync()
+    {
+        if (_queue is not null)
+            await _queue.DisposeAsync().ConfigureAwait(false);
+        _queue = null;
+
+        _downloader?.Dispose();
+        _downloader = null;
+        _store?.Dispose();
+        _store = null;
+        _sendGate.Dispose();
+    }
+
+    private async Task EnsureConfigTemplateAsync()
+    {
+        var path = Context.Config.ConfigPath;
+        if (File.Exists(path)) return;
+
+        try
+        {
+            var directory = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+            await File.WriteAllTextAsync(path, DefaultConfig).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warning($"Meme 默认配置写入失败：{ex.Message}");
+        }
+    }
+
+    private async Task HandleMessageAsync(MessageEvent message)
+    {
+        if (!_config.Meme.Enabled || _store is null || _queue is null) return;
+
+        var key = _store.GroupKey(message.Platform, message.InstanceId, message.Channel.Id);
+        var settings = _store.GetGroupSettings(key);
+        if (!message.IsDirect && !settings.Enabled) return;
+
+        foreach (var job in MemeCollector.BuildJobs(message, _config.Meme, settings, force: false))
+            _queue.TryEnqueue(job);
+    }
+
+    private async Task HandleMemeCommandAsync(MessageEvent message)
+    {
+        var text = message.GetPlainText().Trim();
+        var args = text.Length > CommandPrefix.Length
+            ? text[CommandPrefix.Length..].Trim()
+            : "";
+
+        if (!_config.Meme.Enabled)
+        {
+            await ReplyTextAsync(message, "表情库当前已关闭。").ConfigureAwait(false);
+            return;
+        }
+
+        if (_store is null || _sender is null)
+        {
+            await ReplyTextAsync(message, "表情库尚未初始化完成。").ConfigureAwait(false);
+            return;
+        }
+
+        var parts = args.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var sub = parts.Length > 0 ? parts[0].ToLowerInvariant() : "help";
+        var rest = parts.Length > 1 ? parts[1].Trim() : "";
+
+        switch (sub)
+        {
+            case "help":
+                await ReplyTextAsync(message, HelpText).ConfigureAwait(false);
+                break;
+            case "stats":
+                var stats = _store.GetStats();
+                await ReplyTextAsync(message,
+                    $"表情库：{stats.Count} 张，{stats.Bytes / 1024.0 / 1024.0:F1} MB，最近更新 {stats.LastUpdated?.ToLocalTime():yyyy-MM-dd HH:mm}").ConfigureAwait(false);
+                break;
+            case "list":
+                await ListAsync(message, rest).ConfigureAwait(false);
+                break;
+            case "random":
+                await RandomAsync(message, rest).ConfigureAwait(false);
+                break;
+            case "save":
+                await SaveQuotedAsync(message).ConfigureAwait(false);
+                break;
+            case "add":
+                await AddUrlAsync(message, rest).ConfigureAwait(false);
+                break;
+            case "tag":
+                await TagAsync(message, rest).ConfigureAwait(false);
+                break;
+            case "del":
+                await DeleteAsync(message, rest).ConfigureAwait(false);
+                break;
+            case "off":
+                await SetGroupEnabledAsync(message, false).ConfigureAwait(false);
+                break;
+            case "on":
+                await SetGroupEnabledAsync(message, true).ConfigureAwait(false);
+                break;
+            default:
+                await ReplyTextAsync(message, HelpText).ConfigureAwait(false);
+                break;
+        }
+    }
+
+    private async Task ListAsync(MessageEvent message, string tag)
+    {
+        var items = _store!.Search(tag, null, 20);
+        if (items.Count == 0)
+        {
+            await ReplyTextAsync(message, "没有找到匹配的表情。").ConfigureAwait(false);
+            return;
+        }
+
+        var lines = items.Select(item =>
+            $"{item.Id[..Math.Min(8, item.Id.Length)]}  {item.Caption}  [{string.Join(",", item.Tags.Take(5))}]");
+        await ReplyTextAsync(message, "表情库：\n" + string.Join("\n", lines)).ConfigureAwait(false);
+    }
+
+    private async Task RandomAsync(MessageEvent message, string query)
+    {
+        var selection = await SelectAsync(new MemeQuery(query, ChannelId: message.Channel.Id), CancellationToken.None)
+            .ConfigureAwait(false);
+        if (selection is null)
+        {
+            await ReplyTextAsync(message, "暂时没有合适的表情，或本会话正在冷却。").ConfigureAwait(false);
+            return;
+        }
+
+        var result = await SendAsync(selection, BuildTarget(message), null, CancellationToken.None)
+            .ConfigureAwait(false);
+        if (!result.Success)
+            await ReplyTextAsync(message, $"发送失败：{result.Error}").ConfigureAwait(false);
+    }
+
+    private async Task SaveQuotedAsync(MessageEvent message)
+    {
+        var quote = message.GetQuote();
+        if (quote is null)
+        {
+            await ReplyTextAsync(message, "请引用一张图片/商城表情后再发送 #meme save。").ConfigureAwait(false);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(message.InstanceId))
+        {
+            await ReplyTextAsync(message, "当前消息没有适配器实例信息，无法读取引用消息。").ConfigureAwait(false);
+            return;
+        }
+
+        MessageEvent? quoted;
+        try
+        {
+            quoted = await Context.Message.GetMessageAsync(
+                new MessageReference(message.InstanceId, message.Channel, quote.MessageId)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await ReplyTextAsync(message, $"读取引用消息失败：{ex.Message}").ConfigureAwait(false);
+            return;
+        }
+
+        if (quoted is null)
+        {
+            await ReplyTextAsync(message, "引用消息不存在或无法读取。").ConfigureAwait(false);
+            return;
+        }
+
+        var key = _store!.GroupKey(message.Platform, message.InstanceId, message.Channel.Id);
+        var settings = _store.GetGroupSettings(key);
+        var jobs = MemeCollector.BuildJobs(quoted, _config.Meme, settings, force: true);
+        foreach (var job in jobs)
+            _queue!.TryEnqueue(job);
+
+        await ReplyTextAsync(message, jobs.Count > 0 ? "已加入表情采集队列。" : "引用消息里没有可采集的图片。")
+            .ConfigureAwait(false);
+    }
+
+    private async Task AddUrlAsync(MessageEvent message, string rest)
+    {
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyTextAsync(message, "只有管理员可以添加外部图片。").ConfigureAwait(false);
+            return;
+        }
+
+        var parts = rest.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+        {
+            await ReplyTextAsync(message, "用法：#meme add <http(s) 图片地址> [标签]").ConfigureAwait(false);
+            return;
+        }
+
+        var downloaded = await _downloader!.DownloadAsync(parts[0], CancellationToken.None).ConfigureAwait(false);
+        if (downloaded is null)
+        {
+            await ReplyTextAsync(message, "下载失败或不是允许的图片格式。").ConfigureAwait(false);
+            return;
+        }
+
+        var tags = MemeTagging.ExtractTags(parts.Length > 1 ? parts[1] : "", null, null);
+        var item = await _store!.AddAsync(
+            downloaded.Data,
+            downloaded.Mime,
+            MemeTagging.BuildCaption(null, parts.Length > 1 ? parts[1] : "", _config.Meme.CaptionMaxChars),
+            tags,
+            MemeTagging.GuessEmotions(parts.Length > 1 ? parts[1] : ""),
+            new MemeSource
+            {
+                Platform = message.Platform,
+                InstanceId = message.InstanceId,
+                ChannelId = message.Channel.Id,
+                SenderId = message.Sender.Id,
+                MessageId = message.MessageId,
+                Timestamp = DateTimeOffset.UtcNow,
+            },
+            null).ConfigureAwait(false);
+
+        await ReplyTextAsync(message,
+            item is null ? "添加失败：文件过大或不是有效图片。" : $"已添加：{item.Id[..Math.Min(8, item.Id.Length)]}").ConfigureAwait(false);
+    }
+
+    private async Task TagAsync(MessageEvent message, string rest)
+    {
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyTextAsync(message, "只有管理员可以修改标签。").ConfigureAwait(false);
+            return;
+        }
+
+        var parts = rest.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 2)
+        {
+            await ReplyTextAsync(message, "用法：#meme tag <ID> <标签1 标签2...>").ConfigureAwait(false);
+            return;
+        }
+
+        var tags = parts[1].Split([' ', ',', '，'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var ok = await _store!.UpdateTagsAsync(parts[0], tags).ConfigureAwait(false);
+        await ReplyTextAsync(message, ok ? "标签已更新。" : "没有找到该表情。").ConfigureAwait(false);
+    }
+
+    private async Task DeleteAsync(MessageEvent message, string id)
+    {
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyTextAsync(message, "只有管理员可以删除表情。").ConfigureAwait(false);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            await ReplyTextAsync(message, "用法：#meme del <ID>").ConfigureAwait(false);
+            return;
+        }
+
+        var ok = await _store!.RemoveAsync(id.Trim()).ConfigureAwait(false);
+        await ReplyTextAsync(message, ok ? "已删除。" : "没有找到该表情。").ConfigureAwait(false);
+    }
+
+    private async Task SetGroupEnabledAsync(MessageEvent message, bool enabled)
+    {
+        if (message.IsDirect)
+        {
+            await ReplyTextAsync(message, "该命令仅用于群聊。").ConfigureAwait(false);
+            return;
+        }
+
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyTextAsync(message, "只有管理员可以修改本群的采集开关。").ConfigureAwait(false);
+            return;
+        }
+
+        var key = _store!.GroupKey(message.Platform, message.InstanceId, message.Channel.Id);
+        var settings = _store.GetGroupSettings(key) with { Enabled = enabled };
+        await _store.SetGroupSettingsAsync(key, settings).ConfigureAwait(false);
+        await ReplyTextAsync(message, enabled ? "本群表情采集已开启。" : "本群表情采集已关闭。").ConfigureAwait(false);
+    }
+
+    private Task ReplyTextAsync(MessageEvent message, string text)
+    {
+        if (message.IsDirect)
+            return Context.Message.ReplyAsync(message, text);
+
+        var segments = new List<MessageSegment>();
+        if (_config.Meme.SendWithMention)
+            segments.Add(new MentionSegment(message.Sender.Id));
+        segments.Add(new TextSegment(text));
+        return Context.Message.SendMessageAsync(message.Channel, segments);
+    }
+
+    private MemeSendTarget BuildTarget(MessageEvent message) =>
+        new(
+            message.Platform,
+            message.InstanceId,
+            message.Channel.Type.ToString(),
+            message.Channel.Id,
+            message.MessageId,
+            message.Sender.Id,
+            !message.IsDirect,
+            _config.Meme.SendWithMention,
+            _config.Meme.SendWithQuote);
+
+    public async Task<MemeSelection?> SelectAsync(MemeQuery query, CancellationToken cancellationToken = default)
+    {
+        if (!_config.Meme.Enabled || _store is null) return null;
+
+        var key = string.IsNullOrWhiteSpace(query.ChannelId) ? "global" : query.ChannelId;
+        if (IsBlocked(key)) return null;
+
+        var candidates = _store.Search(query.Query, query.Emotion, Math.Max(1, query.Limit));
+        if (candidates.Count == 0 && (!string.IsNullOrWhiteSpace(query.Query) ||
+                                      !string.IsNullOrWhiteSpace(query.Emotion)))
+        {
+            // 模型/用户给的关键词未必命中本地标签；库里非空时退化为随机可用表情，
+            // 避免“明明有图却回复没货”。
+            candidates = _store.Search("", null, Math.Max(1, query.Limit));
+        }
+
+        if (candidates.Count == 0) return null;
+
+        lock (_recent)
+        {
+            if (_recent.TryGetValue(key, out var recent) && recent.Count > 0)
+            {
+                var filtered = candidates.Where(c => !recent.Contains(c.Id)).ToList();
+                if (filtered.Count > 0) candidates = filtered;
+            }
+        }
+
+        return candidates[Random.Shared.Next(candidates.Count)];
+    }
+
+    public async Task<MemeSendResult> SendAsync(
+        MemeSelection selection,
+        MemeSendTarget target,
+        string? caption = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!_config.Meme.Enabled || _sender is null || _store is null)
+            return new MemeSendResult(false, Error: "表情库未启用");
+
+        await _sendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var key = string.IsNullOrWhiteSpace(target.ChannelId) ? "global" : target.ChannelId;
+            if (IsBlocked(key))
+                return new MemeSendResult(false, Error: "本会话表情发送正在冷却或已达每小时上限");
+
+            var result = await _sender.SendAsync(selection, target, caption, cancellationToken)
+                .ConfigureAwait(false);
+            if (!result.Success) return result;
+
+            await _store.MarkUsedAsync(selection.Id, cancellationToken).ConfigureAwait(false);
+
+            lock (_usage)
+            {
+                if (!_usage.TryGetValue(key, out var usage))
+                    _usage[key] = usage = new ChannelUsage();
+                var now = DateTimeOffset.UtcNow;
+                usage.LastSent = now;
+                usage.SentAt.Enqueue(now);
+                while (usage.SentAt.Count > 0 && now - usage.SentAt.Peek() > TimeSpan.FromHours(1))
+                    usage.SentAt.Dequeue();
+            }
+
+            lock (_recent)
+            {
+                if (!_recent.TryGetValue(key, out var recent))
+                    _recent[key] = recent = new Queue<string>();
+                recent.Enqueue(selection.Id);
+                while (recent.Count > 30)
+                    recent.Dequeue();
+            }
+
+            return result;
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    public Task<MemeLibraryStats> GetStatsAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(_store?.GetStats() ?? new MemeLibraryStats(0, 0, null));
+
+    private bool IsBlocked(string key)
+    {
+        lock (_usage)
+        {
+            if (!_usage.TryGetValue(key, out var usage)) return false;
+            var now = DateTimeOffset.UtcNow;
+            while (usage.SentAt.Count > 0 && now - usage.SentAt.Peek() > TimeSpan.FromHours(1))
+                usage.SentAt.Dequeue();
+
+            if (_config.Meme.CooldownSeconds > 0 &&
+                usage.LastSent != default &&
+                now - usage.LastSent < TimeSpan.FromSeconds(_config.Meme.CooldownSeconds))
+                return true;
+
+            return _config.Meme.MaxPerHour > 0 && usage.SentAt.Count >= _config.Meme.MaxPerHour;
+        }
+    }
+
+    private const string HelpText = """
+        #meme 用法：
+        #meme list [关键词]     查看表情
+        #meme random [关键词]   随机发送一张
+        #meme save              引用图片/商城表情后收录
+        #meme add <url> [标签]  管理员添加外部图片
+        #meme tag <ID> <标签>   管理员修改标签
+        #meme del <ID>          管理员删除
+        #meme off / on          管理员开关本群自动采集
+        #meme stats             查看容量
+        """;
+
+    private sealed class ChannelUsage
+    {
+        public DateTimeOffset LastSent { get; set; }
+        public Queue<DateTimeOffset> SentAt { get; } = new();
+    }
+}
