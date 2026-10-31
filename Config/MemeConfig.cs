@@ -71,6 +71,30 @@ public sealed class MemeSection
 
     [ConfigField("可选：管理页/图片接口访问令牌；留空表示不校验。设置后需在管理页 URL 带 token。", Label = "管理页访问令牌", Type = "password")]
     public string LibraryToken { get; set; } = "";
+
+    [ConfigField("启用 AI 视觉标注：让多模态模型识别表情内容，生成描述、标签和情绪；失败时回退本地规则。", Label = "AI 标注")]
+    public bool AiTaggingEnabled { get; set; }
+
+    [ConfigField("OpenAI 兼容视觉接口，例如 http://10.157.0.10:8888/v1；留空则跳过 AI 标注。", Label = "AI 接口地址")]
+    public string AiBaseUrl { get; set; } = "";
+
+    [ConfigField("AI API Key；本地免鉴权服务可留空。", Label = "AI API Key", Type = "password")]
+    public string AiApiKey { get; set; } = "";
+
+    [ConfigField("支持图片输入的模型名，例如 DeepSeek-v4.1-Flash-EXL3。", Label = "AI 模型")]
+    public string AiModel { get; set; } = "";
+
+    [ConfigField("AI 标注请求超时秒数。", Label = "AI 超时（秒）", Min = 5, Max = 120)]
+    public int AiTimeoutSeconds { get; set; } = 30;
+
+    [ConfigField("AI 最多生成多少个标签。", Label = "AI 标签数", Min = 1, Max = 16)]
+    public int AiMaxTags { get; set; } = 8;
+
+    [ConfigField("是否让 AI 同时判定情绪（happy/sad/angry/confused/shy/daily）。", Label = "AI 判定情绪")]
+    public bool AiInferEmotions { get; set; } = true;
+
+    [ConfigField("AI 附加提示词；留空使用默认。", Label = "AI 附加提示")]
+    public string AiPrompt { get; set; } = "";
 }
 
 public sealed class NetworkSection

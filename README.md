@@ -72,6 +72,14 @@ caption_max_chars = 120
 download_timeout_seconds = 15
 library_dir = "memes"
 library_token = ""         # 可选：管理页/图片接口令牌；留空不校验
+ai_tagging_enabled = false # 启用多模态 AI 标注
+ai_base_url = ""           # OpenAI 兼容接口，例如 http://10.157.0.10:8888/v1
+ai_api_key = ""            # 本地免鉴权可留空
+ai_model = ""              # 支持图片输入的模型名
+ai_timeout_seconds = 30
+ai_max_tags = 8
+ai_infer_emotions = true
+ai_prompt = ""
 
 [network]
 http_proxy = ""
@@ -96,11 +104,16 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 #meme del <ID>           管理员删除（ID 可用前缀）
 #meme off / on           管理员开关本群自动采集
 #meme stats              查看容量
+#meme retag [all]        管理员：AI 重新标注；all 标注全部
 ```
 
 插件配置弹窗里新增“表情库”标签，可直接查看已保存的表情；该页面地址为
 `/plugin/MemePlugin/library`，图片接口为 `/plugin/MemePlugin/library/image?id=<ID>`。
 如果设置了 `library_token`，管理页和图片接口都需要带 `token` 查询参数。
+
+启用 `ai_tagging_enabled` 并配置接口/模型后，新采集的图片会由多模态模型生成描述、标签和情绪；
+AI 失败或超时自动回退到本地关键词规则。已有表情可用 `#meme retag` 重新标注空泛标签，
+`#meme retag all` 重新标注全部。
 
 ## 与 AI 聊天插件配合
 

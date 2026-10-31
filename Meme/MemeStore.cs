@@ -254,6 +254,36 @@ internal sealed class MemeStore : IDisposable
             .ToList();
     }
 
+    public MemeItem? FindExisting(byte[] data, MarketFaceInfo? marketFace)
+    {
+        if (data.Length == 0) return null;
+        var hash = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
+        lock (_sync)
+        {
+            if (_byHash.TryGetValue(hash, out var existing)) return existing;
+            if (MarketFaceKey(marketFace) is { } marketKey &&
+                _byMarketFace.TryGetValue(marketKey, out existing)) return existing;
+        }
+
+        if (Config.PerceptualThreshold <= 0) return null;
+        var fingerprint = MemePerceptualHash.Compute(data);
+        if (fingerprint is not { } candidate) return null;
+        lock (_sync)
+        {
+            foreach (var existing in _items)
+            {
+                if (existing.PerceptualHash is { } otherHash &&
+                    existing.AverageColor is { } otherColor &&
+                    MemePerceptualHash.Distance(candidate.Hash, otherHash) <= Config.PerceptualThreshold &&
+                    MemePerceptualHash.ColorClose(candidate.AverageColor, otherColor,
+                        Config.PerceptualColorThreshold))
+                    return existing;
+            }
+        }
+
+        return null;
+    }
+
     public IReadOnlyList<MemeItem> GetItems()
     {
         lock (_sync)
@@ -348,6 +378,41 @@ internal sealed class MemeStore : IDisposable
                 var index = FindItemIndex(id);
                 if (index < 0) return false;
                 var updated = _items[index] with { Tags = Normalize(tags, 16) };
+                _items[index] = updated;
+                _byHash[updated.Hash] = updated;
+                if (MarketFaceKey(updated.MarketFace) is { } marketKey)
+                    _byMarketFace[marketKey] = updated;
+            }
+
+            await SaveIndexLockedAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool> UpdateMetadataAsync(
+        string id,
+        string caption,
+        IEnumerable<string> tags,
+        IEnumerable<string> emotions,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+            {
+                var index = FindItemIndex(id);
+                if (index < 0) return false;
+                var updated = _items[index] with
+                {
+                    Caption = Trim(caption, Config.CaptionMaxChars),
+                    Tags = Normalize(tags, 16),
+                    Emotions = Normalize(emotions, 8),
+                };
                 _items[index] = updated;
                 _byHash[updated.Hash] = updated;
                 if (MarketFaceKey(updated.MarketFace) is { } marketKey)

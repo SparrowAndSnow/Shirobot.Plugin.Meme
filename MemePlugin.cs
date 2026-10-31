@@ -44,6 +44,14 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         download_timeout_seconds = 15
         library_dir = "memes"
         library_token = ""
+        ai_tagging_enabled = false
+        ai_base_url = ""
+        ai_api_key = ""
+        ai_model = ""
+        ai_timeout_seconds = 30
+        ai_max_tags = 8
+        ai_infer_emotions = true
+        ai_prompt = ""
 
         [network]
         http_proxy = ""
@@ -54,6 +62,9 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
     private MemeDownloader? _downloader;
     private MemeIngestQueue? _queue;
     private MemeSender? _sender;
+    private MemeAiTagger? _tagger;
+    private readonly CancellationTokenSource _lifetime = new();
+    private int _retagRunning;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
@@ -70,6 +81,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         _store?.UpdateConfig(current.Meme);
         if (_sender is not null && Context is not null)
             _sender = new MemeSender(Context, current.Meme);
+        _tagger?.UpdateConfig(current.Meme, current.Network);
         return Task.CompletedTask;
     }
 
@@ -91,7 +103,8 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         await _store.LoadAsync().ConfigureAwait(false);
 
         _downloader = new MemeDownloader(_config.Meme, _config.Network);
-        _queue = new MemeIngestQueue(_store, _downloader);
+        _tagger = new MemeAiTagger(_config.Meme, _config.Network);
+        _queue = new MemeIngestQueue(_store, _downloader, _tagger);
         _sender = new MemeSender(Context, _config.Meme);
 
         Context.Services.RegisterSingleton<IMemeService>(this);
@@ -206,10 +219,14 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
             await _queue.DisposeAsync().ConfigureAwait(false);
         _queue = null;
 
+        _lifetime.Cancel();
         _downloader?.Dispose();
         _downloader = null;
+        _tagger?.Dispose();
+        _tagger = null;
         _store?.Dispose();
         _store = null;
+        _lifetime.Dispose();
         _sendGate.Dispose();
     }
 
@@ -276,6 +293,9 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
                 await ReplyTextAsync(message,
                     $"表情库：{stats.Count} 张，{stats.Bytes / 1024.0 / 1024.0:F1} MB，最近更新 {stats.LastUpdated?.ToLocalTime():yyyy-MM-dd HH:mm}").ConfigureAwait(false);
                 break;
+            case "retag":
+                await RetagAsync(message, rest).ConfigureAwait(false);
+                break;
             case "list":
                 await ListAsync(message, rest).ConfigureAwait(false);
                 break;
@@ -304,6 +324,93 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
                 await ReplyTextAsync(message, HelpText).ConfigureAwait(false);
                 break;
         }
+    }
+
+    private async Task RetagAsync(MessageEvent message, string argument)
+    {
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyTextAsync(message, "只有管理员可以触发 AI 重新标注。").ConfigureAwait(false);
+            return;
+        }
+
+        if (_tagger is null || !_tagger.IsConfigured)
+        {
+            await ReplyTextAsync(message, "AI 标注未配置：请在“表情库设置”里填写 AI 接口地址、模型和 Key。").ConfigureAwait(false);
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _retagRunning, 1) != 0)
+        {
+            await ReplyTextAsync(message, "AI 重新标注已经在运行。").ConfigureAwait(false);
+            return;
+        }
+
+        var all = string.Equals(argument.Trim(), "all", StringComparison.OrdinalIgnoreCase);
+        var store = _store;
+        var tagger = _tagger;
+        var items = store!.GetItems()
+            .Where(item => all || NeedsAiTags(item))
+            .ToList();
+        if (items.Count == 0)
+        {
+            Interlocked.Exchange(ref _retagRunning, 0);
+            await ReplyTextAsync(message, "没有需要重新标注的表情。").ConfigureAwait(false);
+            return;
+        }
+
+        await ReplyTextAsync(message, $"已开始 AI 重新标注 {items.Count} 张（{(all ? "全部" : "仅空泛标签")}），完成后会写入日志。")
+            .ConfigureAwait(false);
+
+        _ = Task.Run(async () =>
+        {
+            var updated = 0;
+            try
+            {
+                foreach (var item in items)
+                {
+                    if (_lifetime.IsCancellationRequested) break;
+                    var path = Path.Combine(store.FilesDirectory, item.FileName);
+                    if (!File.Exists(path)) continue;
+
+                    var data = await File.ReadAllBytesAsync(path, _lifetime.Token).ConfigureAwait(false);
+                    var ai = await tagger.TagAsync(data, item.Mime,
+                        $"{item.Caption} {string.Join(" ", item.Tags)}", _lifetime.Token).ConfigureAwait(false);
+                    if (ai is null) continue;
+
+                    var caption = string.IsNullOrWhiteSpace(ai.Caption) ? item.Caption : ai.Caption;
+                    var tags = ai.Tags.Count > 0 ? ai.Tags : item.Tags;
+                    var emotions = ai.Emotions.Count > 0 ? ai.Emotions : item.Emotions;
+                    if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, _lifetime.Token).ConfigureAwait(false))
+                        updated++;
+                }
+
+                BotLog.Info($"Meme AI 重新标注完成：{updated}/{items.Count} 张");
+            }
+            catch (OperationCanceledException)
+            {
+                BotLog.Info($"Meme AI 重新标注已取消：{updated}/{items.Count} 张");
+            }
+            catch (Exception ex)
+            {
+                BotLog.Warning($"Meme AI 重新标注失败：{ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _retagRunning, 0);
+            }
+        }, _lifetime.Token);
+    }
+
+    private static bool NeedsAiTags(MemeItem item)
+    {
+        if (item.Caption is "表情包" or "[图片]" or "[动画表情]" or "[image]" or "[sticker]")
+            return true;
+        var generic = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "[图片]", "[动画表情]", "[image]", "[sticker]", "表情", "图片",
+        };
+        return item.Tags.Count == 0 || item.Tags.All(generic.Contains);
     }
 
     private async Task ListAsync(MessageEvent message, string tag)
@@ -617,6 +724,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         #meme del <ID>          管理员删除
         #meme off / on          管理员开关本群自动采集
         #meme stats             查看容量
+        #meme retag [all]       管理员：AI 重新标注空泛标签；all 标注全部
         """;
 
     private sealed class ChannelUsage

@@ -10,13 +10,15 @@ internal sealed class MemeIngestQueue : IAsyncDisposable
     private readonly Channel<MemeIngestJob> _channel;
     private readonly MemeStore _store;
     private readonly MemeDownloader _downloader;
+    private readonly MemeAiTagger? _tagger;
     private readonly Task _worker;
     private bool _completed;
 
-    public MemeIngestQueue(MemeStore store, MemeDownloader downloader)
+    public MemeIngestQueue(MemeStore store, MemeDownloader downloader, MemeAiTagger? tagger = null)
     {
         _store = store;
         _downloader = downloader;
+        _tagger = tagger;
         _channel = Channel.CreateBounded<MemeIngestJob>(new BoundedChannelOptions(64)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
@@ -43,9 +45,32 @@ internal sealed class MemeIngestQueue : IAsyncDisposable
                     !MemeTagging.IsStickerLike(job.SubType, downloaded.Mime))
                     continue;
 
+                // 先查重再调用 AI，避免为同一张转发图重复付费。
+                var existing = _store.FindExisting(downloaded.Data, job.MarketFace);
+                if (existing is not null)
+                {
+                    BotLog.Info($"Meme 已存在 {existing.Id[..Math.Min(8, existing.Id.Length)]}，跳过");
+                    continue;
+                }
+
                 var tags = MemeTagging.ExtractTags(job.MessageText, job.Summary, job.MarketFace);
                 var emotions = MemeTagging.GuessEmotions($"{job.MessageText} {job.Summary}");
                 var caption = MemeTagging.BuildCaption(job.Summary, job.MessageText, config.CaptionMaxChars);
+
+                if (_tagger is { } tagger && tagger.IsConfigured)
+                {
+                    var ai = await tagger.TagAsync(
+                        downloaded.Data,
+                        downloaded.Mime,
+                        $"{job.MessageText} {job.Summary} {job.MarketFace?.Summary}",
+                        CancellationToken.None).ConfigureAwait(false);
+                    if (ai is not null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(ai.Caption)) caption = ai.Caption;
+                        if (ai.Tags.Count > 0) tags = ai.Tags.ToList();
+                        if (ai.Emotions.Count > 0) emotions = ai.Emotions.ToList();
+                    }
+                }
 
                 var item = await _store.AddAsync(
                     downloaded.Data,
