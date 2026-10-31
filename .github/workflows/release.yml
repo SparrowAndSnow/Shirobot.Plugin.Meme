@@ -33,7 +33,7 @@ jobs:
       - name: Publish
         run: dotnet publish ShiroBot.MemePlugin.csproj --configuration Release
 
-      - name: Collect plugin and shared contract
+      - name: Package plugin ZIP
         shell: bash
         run: |
           PLUGIN_DLL="$PUBLISH_DIR/ShiroBot.MemePlugin.dll"
@@ -61,10 +61,13 @@ jobs:
 
           mkdir -p release
           cp "$PLUGIN_DLL" "$CONTRACT_DLL" release/
+          cd release
+          zip -9 ShiroBot.MemePlugin.zip ShiroBot.MemePlugin.dll ShiroBot.Meme.Contracts.dll
+          unzip -l ShiroBot.MemePlugin.zip
 
-      - name: Upload DLLs to Release
+      - name: Upload plugin ZIP to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: release/*.dll
+          files: release/ShiroBot.MemePlugin.zip
