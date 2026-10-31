@@ -124,6 +124,7 @@ internal sealed class MemeStore : IDisposable
         IEnumerable<string> emotions,
         MemeSource source,
         MarketFaceInfo? marketFace,
+        string? kind = null,
         CancellationToken cancellationToken = default)
     {
         if (data.Length == 0 || data.Length > Config.MaxBytes)
@@ -180,6 +181,7 @@ internal sealed class MemeStore : IDisposable
                 Emotions = Normalize(emotions, 8),
                 Source = source,
                 MarketFace = marketFace,
+                Kind = NormalizeKind(kind),
                 PerceptualHash = fingerprint?.Hash,
                 AverageColor = fingerprint?.AverageColor,
                 Bytes = data.Length,
@@ -398,6 +400,7 @@ internal sealed class MemeStore : IDisposable
         string caption,
         IEnumerable<string> tags,
         IEnumerable<string> emotions,
+        string? kind = null,
         CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -412,6 +415,7 @@ internal sealed class MemeStore : IDisposable
                     Caption = Trim(caption, Config.CaptionMaxChars),
                     Tags = Normalize(tags, 16),
                     Emotions = Normalize(emotions, 8),
+                    Kind = kind is null ? _items[index].Kind : NormalizeKind(kind),
                 };
                 _items[index] = updated;
                 _byHash[updated.Hash] = updated;
@@ -635,6 +639,16 @@ internal sealed class MemeStore : IDisposable
         }
         return result;
     }
+
+    private static string NormalizeKind(string? kind) =>
+        (kind ?? "").Trim().ToLowerInvariant() switch
+        {
+            "meme" => "meme",
+            "screenshot" => "screenshot",
+            "photo" => "photo",
+            "other" => "other",
+            _ => "unknown",
+        };
 
     private static string Trim(string value, int max) =>
         string.IsNullOrWhiteSpace(value) ? "" : value.Trim()[..Math.Min(value.Trim().Length, Math.Max(0, max))];

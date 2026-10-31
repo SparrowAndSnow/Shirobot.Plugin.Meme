@@ -42,9 +42,10 @@ var png = Convert.FromBase64String(
     Check(store.CountMatching("猫", null) == 1 && store.CountMatching("不存在", null) == 0,
         "store count matching");
     Check(store.FindExisting(png, null)?.Id == item!.Id, "store find existing before AI tagging");
-    Check(await store.UpdateMetadataAsync(item!.Id, "AI 猫猫", ["猫猫", "搞笑"], ["happy"]),
+    Check(await store.UpdateMetadataAsync(item!.Id, "AI 猫猫", ["猫猫", "搞笑"], ["happy"], "meme"),
         "store update AI metadata");
     Check(store.Search("搞笑", null, 8).Count == 1, "store search AI tag");
+    Check(store.GetItems().First(i => i.Id == item.Id).Kind == "meme", "store persists AI kind");
     Check(store.Search("", "happy", 8).Count == 1, "store search by emotion");
     Check(store.GetById(item!.Id[..8])?.Id == item.Id, "store unique ID prefix lookup");
     Check(await store.UpdateTagsAsync(item!.Id, ["猫", "无语"]), "store update tags");
@@ -124,11 +125,11 @@ var png = Convert.FromBase64String(
 // ---- AI tagger ----
 {
     var config = new MemeSection { CaptionMaxChars = 120, AiMaxTags = 8, AiInferEmotions = true };
-    var json = """{"choices":[{"message":{"content":"{\"caption\":\"猫猫托腮\",\"tags\":[\"猫\",\"托腮\",\"表情包\"],\"emotions\":[\"happy\",\"daily\"]}"}}]}""";
+    var json = """{"choices":[{"message":{"content":"{\"caption\":\"猫猫托腮\",\"tags\":[\"猫\",\"托腮\",\"表情包\"],\"emotions\":[\"happy\",\"daily\"],\"kind\":\"meme\"}"}}]}""";
     var parsed = MemeAiTagger.Parse(json, config);
     Check(parsed is not null && parsed.Caption == "猫猫托腮" &&
           parsed.Tags.Contains("猫") && !parsed.Tags.Contains("表情包") &&
-          parsed.Emotions.Contains("happy"), "AI tagger parses JSON and filters generic tags");
+          parsed.Emotions.Contains("happy") && parsed.IsMeme, "AI tagger parses JSON, kind and filters generic tags");
     Check(MemeAiTagger.Parse("{\"choices\":[]}", config) is null, "AI tagger rejects empty choices");
 }
 

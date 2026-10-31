@@ -80,6 +80,7 @@ ai_timeout_seconds = 30
 ai_max_tags = 8
 ai_infer_emotions = true
 ai_prompt = ""
+ai_filter_non_meme = true # 自动采集时只保留 AI 判定的表情包
 
 [network]
 http_proxy = ""
@@ -105,6 +106,7 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 #meme off / on           管理员开关本群自动采集
 #meme stats              查看容量
 #meme retag [all]        管理员：AI 重新标注；all 标注全部
+#meme clean [confirm]    管理员：预览/删除 AI 判定为截图、照片的内容
 ```
 
 插件配置弹窗里新增“表情库”标签，可直接查看已保存的表情；该页面地址为
@@ -113,7 +115,8 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 
 启用 `ai_tagging_enabled` 并配置接口/模型后，新采集的图片会由多模态模型生成描述、标签和情绪；
 AI 失败或超时自动回退到本地关键词规则。已有表情可用 `#meme retag` 重新标注空泛标签，
-`#meme retag all` 重新标注全部。
+`#meme retag all` 重新标注全部；AI 会把图片分为 meme/screenshot/photo/other，
+开启 `ai_filter_non_meme` 后自动采集只保留 meme。`#meme clean` 可预览并删除已有截图/照片。
 
 ## 与 AI 聊天插件配合
 

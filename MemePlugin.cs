@@ -52,6 +52,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         ai_max_tags = 8
         ai_infer_emotions = true
         ai_prompt = ""
+        ai_filter_non_meme = true
 
         [network]
         http_proxy = ""
@@ -296,6 +297,9 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
             case "retag":
                 await RetagAsync(message, rest).ConfigureAwait(false);
                 break;
+            case "clean":
+                await CleanAsync(message, rest).ConfigureAwait(false);
+                break;
             case "list":
                 await ListAsync(message, rest).ConfigureAwait(false);
                 break;
@@ -324,6 +328,56 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
                 await ReplyTextAsync(message, HelpText).ConfigureAwait(false);
                 break;
         }
+    }
+
+    private async Task CleanAsync(MessageEvent message, string argument)
+    {
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyTextAsync(message, "只有管理员可以清理表情库。").ConfigureAwait(false);
+            return;
+        }
+
+        var items = _store!.GetItems();
+        var candidates = items
+            .Where(item => item.Kind is "screenshot" or "photo" or "other")
+            .ToList();
+        var unknown = items.Count(item => item.Kind is null or "" or "unknown");
+
+        if (!string.Equals(argument.Trim(), "confirm", StringComparison.OrdinalIgnoreCase))
+        {
+            if (candidates.Count == 0)
+            {
+                var hint = unknown > 0 ? $"另有 {unknown} 张未分类，可先执行 #meme retag all。" : "";
+                await ReplyTextAsync(message, $"没有 AI 判定为截图/照片/其他的条目。{hint}").ConfigureAwait(false);
+                return;
+            }
+
+            var lines = candidates.Take(20).Select(item =>
+                $"{item.Id[..Math.Min(8, item.Id.Length)]} [{item.Kind}] {item.Caption}");
+            var more = candidates.Count > 20 ? $"\n……另有 {candidates.Count - 20} 张" : "";
+            var unknownHint = unknown > 0 ? $"\n另有 {unknown} 张未分类，可先执行 #meme retag all。" : "";
+            await ReplyTextAsync(message,
+                $"AI 判定非表情 {candidates.Count} 张：\n{string.Join("\n", lines)}{more}{unknownHint}\n确认删除请发送 #meme clean confirm。")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (candidates.Count == 0)
+        {
+            await ReplyTextAsync(message, "没有需要删除的条目。").ConfigureAwait(false);
+            return;
+        }
+
+        var removed = 0;
+        foreach (var item in candidates)
+        {
+            if (await _store.RemoveAsync(item.Id).ConfigureAwait(false))
+                removed++;
+        }
+
+        BotLog.Info($"Meme 清理完成：删除 {removed} 张截图/照片");
+        await ReplyTextAsync(message, $"已删除 {removed} 张 AI 判定为截图/照片/其他的条目。").ConfigureAwait(false);
     }
 
     private async Task RetagAsync(MessageEvent message, string argument)
@@ -381,7 +435,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
                     var caption = string.IsNullOrWhiteSpace(ai.Caption) ? item.Caption : ai.Caption;
                     var tags = ai.Tags.Count > 0 ? ai.Tags : item.Tags;
                     var emotions = ai.Emotions.Count > 0 ? ai.Emotions : item.Emotions;
-                    if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, _lifetime.Token).ConfigureAwait(false))
+                    if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, ai.Kind, _lifetime.Token).ConfigureAwait(false))
                         updated++;
                 }
 
@@ -521,12 +575,14 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         var tags = MemeTagging.ExtractTags(text, null, null);
         var caption = MemeTagging.BuildCaption(null, text, _config.Meme.CaptionMaxChars);
         var emotions = MemeTagging.GuessEmotions(text);
+        var kind = "unknown";
         if (_tagger is { } tagger && tagger.IsConfigured)
         {
             var ai = await tagger.TagAsync(downloaded.Data, downloaded.Mime, text, CancellationToken.None)
                 .ConfigureAwait(false);
             if (ai is not null)
             {
+                kind = ai.Kind;
                 if (!string.IsNullOrWhiteSpace(ai.Caption)) caption = ai.Caption;
                 if (ai.Tags.Count > 0) tags = ai.Tags.ToList();
                 if (ai.Emotions.Count > 0) emotions = ai.Emotions.ToList();
@@ -548,7 +604,8 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
                 MessageId = message.MessageId,
                 Timestamp = DateTimeOffset.UtcNow,
             },
-            null).ConfigureAwait(false);
+            null,
+            kind).ConfigureAwait(false);
 
         await ReplyTextAsync(message,
             item is null ? "添加失败：文件过大或不是有效图片。" : $"已添加：{item.Id[..Math.Min(8, item.Id.Length)]}").ConfigureAwait(false);
@@ -748,6 +805,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         #meme off / on          管理员开关本群自动采集
         #meme stats             查看容量
         #meme retag [all]       管理员：AI 重新标注空泛标签；all 标注全部
+        #meme clean [confirm]   管理员：预览/删除 AI 判定为截图、照片的内容
         """;
 
     private sealed class ChannelUsage

@@ -16,6 +16,8 @@ internal sealed record MemeItem
     public string FileName { get; init; } = "";
     public string Mime { get; init; } = "image/png";
     public string Caption { get; init; } = "";
+    /// <summary>AI 视觉分类：meme / screenshot / photo / other / unknown。</summary>
+    public string Kind { get; init; } = "unknown";
     public List<string> Tags { get; init; } = [];
     public List<string> Emotions { get; init; } = [];
     public MemeSource Source { get; init; } = new();

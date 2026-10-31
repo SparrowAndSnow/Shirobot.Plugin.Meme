@@ -95,6 +95,9 @@ public sealed class MemeSection
 
     [ConfigField("AI 附加提示词；留空使用默认。", Label = "AI 附加提示")]
     public string AiPrompt { get; set; } = "";
+
+    [ConfigField("只收录 AI 判定为表情包的内容；截图、照片和其他图片会跳过（仅自动采集，手动 add/save 不受影响）。", Label = "只收录表情包")]
+    public bool AiFilterNonMeme { get; set; } = true;
 }
 
 public sealed class NetworkSection

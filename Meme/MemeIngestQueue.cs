@@ -56,6 +56,7 @@ internal sealed class MemeIngestQueue : IAsyncDisposable
                 var tags = MemeTagging.ExtractTags(job.MessageText, job.Summary, job.MarketFace);
                 var emotions = MemeTagging.GuessEmotions($"{job.MessageText} {job.Summary}");
                 var caption = MemeTagging.BuildCaption(job.Summary, job.MessageText, config.CaptionMaxChars);
+                var kind = "unknown";
 
                 if (_tagger is { } tagger && tagger.IsConfigured)
                 {
@@ -66,6 +67,14 @@ internal sealed class MemeIngestQueue : IAsyncDisposable
                         CancellationToken.None).ConfigureAwait(false);
                     if (ai is not null)
                     {
+                        kind = ai.Kind;
+                        if (!job.Force && config.AiFilterNonMeme &&
+                            kind is "screenshot" or "photo" or "other")
+                        {
+                            BotLog.Info($"Meme AI 判定为 {kind}，跳过收录");
+                            continue;
+                        }
+
                         if (!string.IsNullOrWhiteSpace(ai.Caption)) caption = ai.Caption;
                         if (ai.Tags.Count > 0) tags = ai.Tags.ToList();
                         if (ai.Emotions.Count > 0) emotions = ai.Emotions.ToList();
@@ -87,7 +96,8 @@ internal sealed class MemeIngestQueue : IAsyncDisposable
                         MessageId = job.MessageId,
                         Timestamp = job.Timestamp,
                     },
-                    job.MarketFace).ConfigureAwait(false);
+                    job.MarketFace,
+                    kind).ConfigureAwait(false);
 
                 if (item is not null)
                     BotLog.Info($"Meme 收录 {item.Id[..Math.Min(8, item.Id.Length)]} ({downloaded.Mime}, {downloaded.Data.Length} bytes)");
