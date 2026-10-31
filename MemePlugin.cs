@@ -509,13 +509,36 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
             return;
         }
 
-        var tags = MemeTagging.ExtractTags(parts.Length > 1 ? parts[1] : "", null, null);
-        var item = await _store!.AddAsync(
+        var existing = _store!.FindExisting(downloaded.Data, null);
+        if (existing is not null)
+        {
+            await ReplyTextAsync(message, $"这张图已经在表情库里了（{existing.Id[..Math.Min(8, existing.Id.Length)]}）。")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var text = parts.Length > 1 ? parts[1] : "";
+        var tags = MemeTagging.ExtractTags(text, null, null);
+        var caption = MemeTagging.BuildCaption(null, text, _config.Meme.CaptionMaxChars);
+        var emotions = MemeTagging.GuessEmotions(text);
+        if (_tagger is { } tagger && tagger.IsConfigured)
+        {
+            var ai = await tagger.TagAsync(downloaded.Data, downloaded.Mime, text, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (ai is not null)
+            {
+                if (!string.IsNullOrWhiteSpace(ai.Caption)) caption = ai.Caption;
+                if (ai.Tags.Count > 0) tags = ai.Tags.ToList();
+                if (ai.Emotions.Count > 0) emotions = ai.Emotions.ToList();
+            }
+        }
+
+        var item = await _store.AddAsync(
             downloaded.Data,
             downloaded.Mime,
-            MemeTagging.BuildCaption(null, parts.Length > 1 ? parts[1] : "", _config.Meme.CaptionMaxChars),
+            caption,
             tags,
-            MemeTagging.GuessEmotions(parts.Length > 1 ? parts[1] : ""),
+            emotions,
             new MemeSource
             {
                 Platform = message.Platform,
