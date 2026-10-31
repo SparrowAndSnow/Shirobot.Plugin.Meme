@@ -1,3 +1,6 @@
+using System.Net;
+using System.Text;
+using Microsoft.AspNetCore.Http;
 using ShiroBot.Meme.Contracts;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
@@ -40,6 +43,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         caption_max_chars = 120
         download_timeout_seconds = 15
         library_dir = "memes"
+        library_token = ""
 
         [network]
         http_proxy = ""
@@ -91,7 +95,109 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         _sender = new MemeSender(Context, _config.Meme);
 
         Context.Services.RegisterSingleton<IMemeService>(this);
+        RegisterLibraryRoutes();
         BotLog.Info($"MemePlugin 已加载，表情库：{root}");
+    }
+
+    private void RegisterLibraryRoutes()
+    {
+        var webHost = Context?.WebHost;
+        if (webHost is null || !webHost.IsEnabled) return;
+        try
+        {
+            webHost.MapGet("MemePlugin", "library", ServeLibraryPageAsync);
+            webHost.MapGet("MemePlugin", "library/image", ServeLibraryImage);
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warning($"Meme 管理页路由注册失败：{ex.Message}");
+        }
+    }
+
+    private Task<IResult> ServeLibraryPageAsync(HttpContext context)
+    {
+        if (!LibraryTokenMatches(context)) return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
+        var store = _store;
+        if (store is null) return Task.FromResult(Results.Text("表情库未加载。", "text/plain; charset=utf-8"));
+
+        var query = context.Request.Query["q"].ToString().Trim();
+        var items = store.GetItems()
+            .Where(item => query.Length == 0 ||
+                           item.Caption.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                           item.Tags.Any(tag => tag.Contains(query, StringComparison.OrdinalIgnoreCase)) ||
+                           item.Emotions.Any(emotion => emotion.Contains(query, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(item => item.CreatedAt)
+            .ToList();
+        var stats = store.GetStats();
+        var token = _config.Meme.LibraryToken;
+        var tokenQuery = string.IsNullOrWhiteSpace(token) ? "" : "?token=" + Uri.EscapeDataString(token);
+        var imageTokenQuery = string.IsNullOrWhiteSpace(token) ? "" : "&token=" + Uri.EscapeDataString(token);
+
+        var html = new StringBuilder();
+        html.Append("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">")
+            .Append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">")
+            .Append("<title>表情库 - MemePlugin</title><style>")
+            .Append(":root{color-scheme:light dark;--bg:#f6f4ef;--card:#fff;--text:#1b1b1f;--muted:#68666f;--line:#dedad2;--accent:#5b5bd6}")
+            .Append("@media(prefers-color-scheme:dark){:root{--bg:#17171a;--card:#222226;--text:#f0eef4;--muted:#a9a6b2;--line:#39383f;--accent:#9b9bff}}")
+            .Append("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}")
+            .Append("header{position:sticky;top:0;z-index:2;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:14px 18px}")
+            .Append("h1{margin:0;font-size:20px} .sub{color:var(--muted);font-size:12px;margin-top:3px}")
+            .Append("form{display:flex;gap:8px;margin-top:10px} input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);padding:8px 10px}")
+            .Append("button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:8px 14px;cursor:pointer}")
+            .Append("main{padding:18px;max-width:1400px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}")
+            .Append(".card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}")
+            .Append(".thumb{display:block;width:100%;height:180px;object-fit:contain;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 50%/20px 20px}")
+            .Append(".meta{padding:9px 10px;display:flex;flex-direction:column;gap:3px}.cap{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}")
+            .Append(".tag{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.id{font:11px ui-monospace,monospace;color:var(--muted)}")
+            .Append(".empty{color:var(--muted);padding:60px 0;text-align:center}</style></head><body>")
+            .Append("<header><h1>表情库</h1><div class=\"sub\">共 ").Append(stats.Count).Append(" 张 · ")
+            .Append(stats.Bytes / 1024.0 / 1024.0).Append(" MB")
+            .Append(query.Length == 0 ? "" : " · 当前筛选 " + WebUtility.HtmlEncode(query) + "：" + items.Count + " 张")
+            .Append("</div><form method=\"get\"><input name=\"q\" value=\"").Append(WebUtility.HtmlEncode(query))
+            .Append("\" placeholder=\"按描述/标签/情绪筛选\"><button type=\"submit\">筛选</button></form></header><main>");
+        if (items.Count == 0)
+        {
+            html.Append("<div class=\"empty\">没有匹配的表情。</div>");
+        }
+        else
+        {
+            html.Append("<div class=\"grid\">");
+            foreach (var item in items)
+            {
+                var imageUrl = "/plugin/MemePlugin/library/image?id=" + Uri.EscapeDataString(item.Id) + imageTokenQuery;
+                html.Append("<article class=\"card\"><img class=\"thumb\" loading=\"lazy\" src=\"")
+                    .Append(WebUtility.HtmlEncode(imageUrl)).Append("\" alt=\"")
+                    .Append(WebUtility.HtmlEncode(item.Caption)).Append("\">")
+                    .Append("<div class=\"meta\"><div class=\"cap\" title=\"")
+                    .Append(WebUtility.HtmlEncode(item.Caption)).Append("\">")
+                    .Append(WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption)).Append("</div>")
+                    .Append("<div class=\"tag\">").Append(WebUtility.HtmlEncode(string.Join(" · ", item.Tags.Take(4)))).Append("</div>")
+                    .Append("<div class=\"id\">").Append(WebUtility.HtmlEncode(item.Id[..Math.Min(8, item.Id.Length)]))
+                    .Append(" · 使用 ").Append(item.UseCount).Append(" 次</div></div></article>");
+            }
+            html.Append("</div>");
+        }
+        html.Append("</main></body></html>");
+        return Task.FromResult(Results.Content(html.ToString(), "text/html; charset=utf-8"));
+    }
+
+    private Task<IResult> ServeLibraryImage(HttpContext context)
+    {
+        if (!LibraryTokenMatches(context))
+            return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
+        var id = context.Request.Query["id"].ToString();
+        var selection = _store?.GetById(id);
+        if (selection is null || !File.Exists(selection.FilePath))
+            return Task.FromResult(Results.NotFound());
+        return Task.FromResult(Results.File(selection.FilePath, selection.Mime, enableRangeProcessing: true));
+    }
+
+    private bool LibraryTokenMatches(HttpContext context)
+    {
+        var configured = _config.Meme.LibraryToken;
+        if (string.IsNullOrWhiteSpace(configured)) return true;
+        var supplied = context.Request.Query["token"].ToString();
+        return string.Equals(configured, supplied, StringComparison.Ordinal);
     }
 
     protected override async Task OnUnloadAsync()

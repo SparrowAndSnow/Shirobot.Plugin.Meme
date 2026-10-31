@@ -5,7 +5,7 @@ namespace ShiroBot.MemePlugin.Config;
 [ConfigModel]
 public sealed class MemeConfig
 {
-    [ConfigField("表情库开关、自动采集、发送冷却和容量限制。", Label = "表情库")]
+    [ConfigField("表情库开关、自动采集、发送冷却和容量限制。", Label = "表情库设置")]
     public MemeSection Meme { get; set; } = new();
 
     [ConfigField("下载 QQ 图片/商城表情时使用的代理；留空直连。", Label = "网络")]
@@ -68,6 +68,9 @@ public sealed class MemeSection
 
     [ConfigField("表情文件存放目录，相对插件目录。", Label = "存储目录")]
     public string LibraryDir { get; set; } = "memes";
+
+    [ConfigField("可选：管理页/图片接口访问令牌；留空表示不校验。设置后需在管理页 URL 带 token。", Label = "管理页访问令牌", Type = "password")]
+    public string LibraryToken { get; set; } = "";
 }
 
 public sealed class NetworkSection

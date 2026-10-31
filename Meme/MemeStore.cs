@@ -254,6 +254,12 @@ internal sealed class MemeStore : IDisposable
             .ToList();
     }
 
+    public IReadOnlyList<MemeItem> GetItems()
+    {
+        lock (_sync)
+            return _items.ToList();
+    }
+
     public int CountMatching(string? query, string? emotion)
     {
         List<MemeItem> snapshot;
