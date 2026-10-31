@@ -202,16 +202,17 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
 
     private async Task ListAsync(MessageEvent message, string tag)
     {
-        var items = _store!.Search(tag, null, 20);
-        if (items.Count == 0)
+        var stats = _store!.GetStats();
+        if (string.IsNullOrWhiteSpace(tag))
         {
-            await ReplyTextAsync(message, "没有找到匹配的表情。").ConfigureAwait(false);
+            await ReplyTextAsync(message, $"表情库：共 {stats.Count} 张。").ConfigureAwait(false);
             return;
         }
 
-        var lines = items.Select(item =>
-            $"{item.Id[..Math.Min(8, item.Id.Length)]}  {item.Caption}  [{string.Join(",", item.Tags.Take(5))}]");
-        await ReplyTextAsync(message, "表情库：\n" + string.Join("\n", lines)).ConfigureAwait(false);
+        var count = _store.CountMatching(tag, null);
+        await ReplyTextAsync(message, count == 0
+            ? $"没有找到匹配“{tag}”的表情；表情库共 {stats.Count} 张。"
+            : $"匹配“{tag}”：{count} 张；表情库共 {stats.Count} 张。").ConfigureAwait(false);
     }
 
     private async Task RandomAsync(MessageEvent message, string query)
@@ -502,7 +503,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
 
     private const string HelpText = """
         #meme 用法：
-        #meme list [关键词]     查看表情
+        #meme list [关键词]     查看数量
         #meme random [关键词]   随机发送一张
         #meme save              引用图片/商城表情后收录
         #meme add <url> [标签]  管理员添加外部图片

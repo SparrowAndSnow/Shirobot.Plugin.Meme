@@ -254,6 +254,32 @@ internal sealed class MemeStore : IDisposable
             .ToList();
     }
 
+    public int CountMatching(string? query, string? emotion)
+    {
+        List<MemeItem> snapshot;
+        lock (_sync)
+            snapshot = _items.ToList();
+
+        var normalizedQuery = (query ?? "").Trim();
+        var normalizedEmotion = (emotion ?? "").Trim();
+        var count = 0;
+        foreach (var item in snapshot)
+        {
+            if (normalizedEmotion.Length > 0 &&
+                !item.Emotions.Any(e => string.Equals(e, normalizedEmotion, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            if (normalizedQuery.Length > 0 &&
+                !item.Caption.Contains(normalizedQuery, StringComparison.OrdinalIgnoreCase) &&
+                !item.Tags.Any(t => t.Contains(normalizedQuery, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            count++;
+        }
+
+        return count;
+    }
+
     public MemeSelection? GetById(string id)
     {
         lock (_sync)

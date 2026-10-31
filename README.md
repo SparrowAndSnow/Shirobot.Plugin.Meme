@@ -87,7 +87,7 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 
 ```text
 #meme                    查看帮助
-#meme list [关键词]      查看表情
+#meme list [关键词]      查看数量
 #meme random [关键词]    随机发送一张
 #meme save               引用图片/商城表情后收录
 #meme add <url> [标签]   管理员添加外部图片

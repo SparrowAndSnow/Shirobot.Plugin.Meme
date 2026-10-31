@@ -39,6 +39,8 @@ var png = Convert.FromBase64String(
         new MemeSource { Platform = "qq", ChannelId = "g1" }, null);
     Check(duplicate?.Id == item!.Id && store.GetStats().Count == 1, "store dedupe by SHA-256");
     Check(store.Search("猫", null, 8).Count == 1, "store search by tag");
+    Check(store.CountMatching("猫", null) == 1 && store.CountMatching("不存在", null) == 0,
+        "store count matching");
     Check(store.Search("", "happy", 8).Count == 1, "store search by emotion");
     Check(store.GetById(item!.Id[..8])?.Id == item.Id, "store unique ID prefix lookup");
     Check(await store.UpdateTagsAsync(item!.Id, ["猫", "无语"]), "store update tags");
