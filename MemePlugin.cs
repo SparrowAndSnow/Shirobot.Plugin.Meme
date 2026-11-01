@@ -6,10 +6,11 @@ using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
+using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.meme", ShiroBotPackageKind.Plugin, "1.0.0")]
+[assembly: ShiroBotPackage("shirobot.plugin.meme", ShiroBotPackageKind.Plugin, "1.0.1")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.MemePlugin;
@@ -17,13 +18,13 @@ namespace ShiroBot.MemePlugin;
 [BotPlugin(
     "MemePlugin",
     Name = "表情包插件",
-    Version = "1.0.0",
+    Version = "1.0.1",
     Description = "本地表情库、群聊盗图采集、QQ 商城表情降级发送，并向其他插件提供表情服务。",
     Author = "ShirokaProject",
     Category = PluginCategory.Media,
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ;ShiroBot.Meme.Contracts")]
-public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
+public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDashboardTabProvider
 {
     private const string CommandPrefix = "#meme";
     private const string DefaultConfig = """
@@ -68,6 +69,60 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
     private int _retagRunning;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
+
+    /// <summary>Dashboard-owned gallery tab; the page itself stays a plugin route.</summary>
+    public IReadOnlyList<DashboardTabDescriptor> Tabs
+    {
+        get
+        {
+            var token = _config.Meme.LibraryToken;
+            var tokenQuery = string.IsNullOrWhiteSpace(token) ? "" : "?token=" + Uri.EscapeDataString(token);
+            var actionPath = "/plugin/MemePlugin/library/items/delete?id={id}";
+            if (!string.IsNullOrWhiteSpace(token)) actionPath += "&token=" + Uri.EscapeDataString(token);
+
+            return
+            [
+                new DashboardTabDescriptor(
+                    Id: "library",
+                    Label: "表情库",
+                    Kind: DashboardTabKinds.Gallery,
+                    Icon: "photo_library",
+                    Description: "查看已保存的表情，支持按描述、标签或情绪筛选。",
+                    Order: 55,
+                    Source: new DashboardTabSource("/plugin/MemePlugin/library/items" + tokenQuery),
+                    Fields: new DashboardTabFields(
+                        Image: "image",
+                        Title: "title",
+                        Description: "description",
+                        Tags: "tags"),
+                    Filters:
+                    [
+                        new DashboardTabFilter("q", "搜索", "text"),
+                        new DashboardTabFilter("tag", "标签", "text"),
+                        new DashboardTabFilter("emotion", "情绪", "select",
+                        [
+                            new DashboardTabFilterOption("happy", "开心"),
+                            new DashboardTabFilterOption("sad", "难过"),
+                            new DashboardTabFilterOption("angry", "生气"),
+                            new DashboardTabFilterOption("confused", "困惑"),
+                            new DashboardTabFilterOption("shy", "害羞"),
+                            new DashboardTabFilterOption("daily", "日常")
+                        ])
+                    ],
+                    Pagination: new DashboardTabPagination("page", "page_size", 24),
+                    Actions:
+                    [
+                        new DashboardTabAction(
+                            "delete",
+                            "删除",
+                            actionPath,
+                            "POST",
+                            "确定删除这个表情？",
+                            "danger")
+                    ])
+            ];
+        }
+    }
     private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
 
     protected override Task OnConfigLoadedAsync(MemeConfig config, CancellationToken cancellationToken)
@@ -121,6 +176,8 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         {
             webHost.MapGet("MemePlugin", "library", ServeLibraryPageAsync);
             webHost.MapGet("MemePlugin", "library/image", ServeLibraryImage);
+            webHost.MapGet("MemePlugin", "library/items", ServeLibraryItemsAsync);
+            webHost.MapPost("MemePlugin", "library/items/delete", ServeLibraryDeleteAsync);
         }
         catch (Exception ex)
         {
@@ -193,6 +250,96 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService
         }
         html.Append("</main></body></html>");
         return Task.FromResult(Results.Content(html.ToString(), "text/html; charset=utf-8"));
+    }
+
+    private Task<IResult> ServeLibraryItemsAsync(HttpContext context)
+    {
+        if (!LibraryTokenMatches(context)) return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
+        var store = _store;
+        if (store is null)
+            return Task.FromResult(Results.Json(new { error = "library_not_ready", message = "表情库未加载。" }, statusCode: StatusCodes.Status503ServiceUnavailable));
+
+        var query = context.Request.Query["q"].ToString().Trim();
+        var tag = context.Request.Query["tag"].ToString().Trim();
+        var emotion = context.Request.Query["emotion"].ToString().Trim();
+        var page = ParsePositiveInt(context, "page", 1);
+        var pageSize = Math.Clamp(ParsePositiveInt(context, "page_size", 24), 1, 100);
+
+        var matching = store.GetItems()
+            .Where(item => query.Length == 0 ||
+                           item.Caption.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                           item.Tags.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)) ||
+                           item.Emotions.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)))
+            .Where(item => tag.Length == 0 ||
+                           item.Tags.Any(value => string.Equals(value, tag, StringComparison.OrdinalIgnoreCase)))
+            .Where(item => emotion.Length == 0 ||
+                           item.Emotions.Any(value => string.Equals(value, emotion, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(item => item.CreatedAt)
+            .ToList();
+
+        var total = matching.Count;
+        var pageItems = matching
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(item =>
+            {
+                var imageQuery = string.IsNullOrWhiteSpace(_config.Meme.LibraryToken)
+                    ? ""
+                    : "&token=" + Uri.EscapeDataString(_config.Meme.LibraryToken);
+                var description = item.Emotions.Count > 0
+                    ? string.Join(" · ", item.Emotions)
+                    : string.Join(" · ", item.Tags.Take(4));
+                return new
+                {
+                    id = item.Id,
+                    title = string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption,
+                    description,
+                    image = "/plugin/MemePlugin/library/image?id=" + Uri.EscapeDataString(item.Id) + imageQuery,
+                    tags = item.Tags,
+                    values = new
+                    {
+                        kind = item.Kind,
+                        bytes = item.Bytes,
+                        created_at = item.CreatedAt,
+                        use_count = item.UseCount,
+                        emotions = item.Emotions
+                    },
+                    actions = new[] { "delete" }
+                };
+            })
+            .ToArray();
+
+        return Task.FromResult(Results.Json(new
+        {
+            items = pageItems,
+            total,
+            page,
+            page_size = pageSize,
+            has_more = (long)page * pageSize < total
+        }));
+    }
+
+    private async Task<IResult> ServeLibraryDeleteAsync(HttpContext context)
+    {
+        if (!LibraryTokenMatches(context)) return Results.StatusCode(StatusCodes.Status403Forbidden);
+        var store = _store;
+        if (store is null)
+            return Results.Json(new { ok = false, message = "表情库未加载。" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+
+        var id = context.Request.Query["id"].ToString();
+        if (string.IsNullOrWhiteSpace(id))
+            return Results.Json(new { ok = false, message = "缺少 id。" }, statusCode: StatusCodes.Status400BadRequest);
+
+        var removed = await store.RemoveAsync(id).ConfigureAwait(false);
+        return Results.Json(new { ok = removed, message = removed ? "已删除。" : "未找到该表情。" },
+            statusCode: removed ? StatusCodes.Status200OK : StatusCodes.Status404NotFound);
+    }
+
+    private static int ParsePositiveInt(HttpContext context, string key, int fallback)
+    {
+        return int.TryParse(context.Request.Query[key].ToString(), out var value) && value > 0
+            ? value
+            : fallback;
     }
 
     private Task<IResult> ServeLibraryImage(HttpContext context)
