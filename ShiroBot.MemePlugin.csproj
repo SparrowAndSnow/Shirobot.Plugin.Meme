@@ -12,18 +12,12 @@
         <DebugType>portable</DebugType>
         <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram;ShiroBot.Meme.Contracts</ShiroBotPluginSharedAssemblies>
         <ShiroBotDevelopmentHostEnabled>false</ShiroBotDevelopmentHostEnabled>
-        <!-- Use the SDK project from the sibling host checkout when it exists; release builds use the package. -->
-        <ShiroBotSdkProject Condition="'$(ShiroBotSdkProject)' == '' and Exists('../ShiroBot/SDK/ShiroBot.SDK.csproj')">../ShiroBot/SDK/ShiroBot.SDK.csproj</ShiroBotSdkProject>
     </PropertyGroup>
 
     <ItemGroup>
         <Compile Remove="Tests/**/*.cs;dev/**/*.cs;scripts/**/*.cs;ShiroBot.Meme.Contracts/**/*.cs" />
         <InternalsVisibleTo Include="ShiroBot.MemePlugin.Verification" />
-        <ProjectReference Include="$(ShiroBotSdkProject)" Condition="'$(ShiroBotSdkProject)' != ''" />
-        <ProjectReference Include="../ShiroBot/Models/QQ/ShiroBot.Model.QQ.csproj" Condition="'$(ShiroBotSdkProject)' != ''" />
-        <ProjectReference Include="../ShiroBot/Models/Discord/ShiroBot.Model.Discord.csproj" Condition="'$(ShiroBotSdkProject)' != ''" />
-        <ProjectReference Include="../ShiroBot/Models/Telegram/ShiroBot.Model.Telegram.csproj" Condition="'$(ShiroBotSdkProject)' != ''" />
-        <PackageReference Include="ShiroBot.SDK" Version="1.0.2" Condition="'$(ShiroBotSdkProject)' == ''" />
+        <PackageReference Include="ShiroBot.SDK" Version="1.0.2" />
         <PackageReference Include="StbImageSharp" Version="2.30.16" />
         <ProjectReference Include="ShiroBot.Meme.Contracts/ShiroBot.Meme.Contracts.csproj" />
     </ItemGroup>
