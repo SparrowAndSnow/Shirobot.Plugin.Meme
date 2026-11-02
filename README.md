@@ -12,8 +12,8 @@
 - 检索：标签、描述、情绪（happy/sad/angry/confused/shy/daily），支持关键词。
 - 发送：通用 `ImageSegment`；QQ 适配器可用时尝试 `QOutgoingImage.SubType="sticker"`，
   失败自动回退普通图片。
-- AI 聊天工具：按名称提供 `chat.tool.send_meme`（选图）和 `meme.send`（发送），AI 聊天插件按约定调用，
-  不需要共享程序集；本插件可以随时卸载、更新，不影响 AI 聊天插件。
+- AI 聊天工具：通过 AI 聊天插件的契约提供 `send_meme` 工具（只选图）和同名的回复后动作（在 AI 聊天发出文字后发图）。
+  运行时只交换 JSON，两个插件都可以单独卸载和更新。
 - 冷却：每会话冷却和每小时上限，避免刷屏。
 
 ## 构建
@@ -29,6 +29,11 @@ dotnet publish ShiroBot.MemePlugin.csproj -c Release
 ```text
 ShiroBot.MemePlugin.dll
 ```
+
+### AI 聊天插件的契约
+
+`contracts/ShiroBot.AiChatPlugin.dll` 是 AI 聊天插件的 DLL，只在构建时读取它的契约（`ChatTools` 等类型），
+不会被引用，也不会进入本插件的成品。AI 聊天插件的契约变化时，换成新版 DLL 重新构建即可。
 
 ## 安装
 

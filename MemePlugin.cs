@@ -1,8 +1,8 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Http;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
 using ShiroBot.SDK.Abstractions;
@@ -869,131 +869,81 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
             _config.Meme.SendWithQuote);
 
     /// <summary>
-    /// 按名称提供服务，参数和结果都是 JSON：AI 聊天等插件不需要引用本插件的类型，本插件也不会因为被调用而无法卸载。
-    /// <c>chat.tool.send_meme</c> 只选图，<c>meme.send</c> 在对方的文字回复发出后发送选中的表情。
+    /// 通过 AI 聊天插件的契约提供表情工具：工具只选图，回复后动作在 AI 聊天发出文字后发送。
+    /// 运行时双方只交换 JSON，AI 聊天插件不在时这些服务没人调用，本插件随时可以卸载和更新。
     /// </summary>
     private void RegisterChatServices()
     {
-        Context.Services.Provide("meme.send", HandleSendServiceAsync);
+        ChatTools.AfterReply.Provide(Context, ChatToolName, HandleAfterReplyAsync, new ChatAfterReplyInfo("发送选中的表情"));
         UpdateChatTool();
     }
 
-    /// <summary>按配置注册或注销聊天工具；描述随使用倾向变化，所以每次重新注册。</summary>
+    private const string ChatToolName = "send_meme";
+
+    /// <summary>按配置注册或注销聊天工具；说明随使用倾向变化，所以每次重新注册。</summary>
     private void UpdateChatTool()
     {
         _chatTool?.Dispose();
         _chatTool = null;
         if (!_config.Meme.Enabled || !_config.Meme.AiToolEnabled) return;
-        _chatTool = Context.Services.Provide("chat.tool.send_meme", HandleSendMemeToolAsync,
-            ChatToolMetadata(_config.Meme.AiToolPolicy));
+        _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor(_config.Meme.AiToolPolicy));
     }
 
-    internal static JsonObject ChatToolMetadata(string policy)
+    internal static ChatToolInfo ChatToolInfoFor(string policy)
     {
         var auto = string.Equals(policy, "auto", StringComparison.OrdinalIgnoreCase);
-        return new JsonObject
-        {
-            ["description"] = auto
+        return new ChatToolInfo(
+            auto
                 ? "Select one suitable meme from the local meme library for the current chat. Use proactively in casual conversation, banter, teasing, or emotional replies; do not use for serious answers. The meme is sent after your reply."
                 : "Select one suitable meme from the local meme library, only when the user explicitly asks for a meme or sticker. The meme is sent after your reply.",
-            ["prompt"] = auto
+            PluginJsonSchema.For<SendMemeToolArgs>(),
+            auto
                 ? "你有一个本地表情库。回复别人时，如果语气轻松、在接梗、吐槽、卖萌、打招呼或表达情绪，应主动调用 send_meme 配一张表情，" +
                   "不需要等用户明确要求。严肃回答、求助、工作/学习问题不要发；每次回复最多一张，不要连续发。" +
                   "调用后最终回复只写一句很短的点评或接梗，不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。"
                 : "你有一个本地表情库。只有在用户明确要求发表情、斗图或使用表情时才调用 send_meme；" +
                   "用户没有明确要求时不要主动发。每次回复最多一张，不要连续发。调用后最终回复只写一句很短的点评或接梗，" +
                   "不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。",
-            ["max_calls_per_turn"] = 1,
-            ["parameters"] = new JsonObject
-            {
-                ["type"] = "object",
-                ["additionalProperties"] = false,
-                ["required"] = new JsonArray("query"),
-                ["properties"] = new JsonObject
-                {
-                    ["query"] = new JsonObject { ["type"] = "string", ["description"] = "Short Chinese keyword(s) describing the desired meme, e.g. 猫, 无语, 大笑, 摸鱼." },
-                    ["emotion"] = new JsonObject
-                    {
-                        ["type"] = "string",
-                        ["enum"] = new JsonArray("happy", "sad", "angry", "confused", "shy", "daily"),
-                        ["description"] = "Optional emotion category."
-                    },
-                    ["caption"] = new JsonObject { ["type"] = "string", ["description"] = "Optional short caption, used only when you write no reply text." }
-                }
-            }
-        };
+            MaxCallsPerTurn: 1);
     }
 
-    /// <summary>chat.tool.send_meme：选一张表情，告诉调用方在回复后调用 meme.send 发送。</summary>
-    private async Task<JsonNode?> HandleSendMemeToolAsync(JsonNode? input, CancellationToken cancellationToken)
+    /// <summary>send_meme 工具：选一张表情，要求 AI 聊天在回复后调用同名的回复后动作发送。</summary>
+    private async Task<ChatToolResult> HandleChatToolAsync(ChatToolCall call, CancellationToken cancellationToken)
     {
-        var arguments = input?["arguments"];
-        var context = input?["context"];
-        var query = JsonString(arguments?["query"])?.Trim() ?? "";
-        var emotion = JsonString(arguments?["emotion"])?.Trim();
+        var args = call.Arguments.As<SendMemeToolArgs>();
+        var query = args?.Query?.Trim() ?? "";
+        var emotion = args?.Emotion?.Trim();
         if (query.Length == 0 && string.IsNullOrWhiteSpace(emotion))
-            return new JsonObject { ["content"] = "query or emotion is required." };
+            return new ChatToolResult("query or emotion is required.");
 
-        var selection = await SelectAsync(new MemeQuery(query, emotion,
-            JsonString(context?["channel_id"]), JsonString(context?["sender_id"])), cancellationToken).ConfigureAwait(false);
+        var selection = await SelectAsync(new MemeQuery(query, emotion, call.Context.ChannelId, call.Context.SenderId), cancellationToken)
+            .ConfigureAwait(false);
         if (selection is null)
-            return new JsonObject { ["content"] = "No suitable meme is available right now, or this conversation is in cooldown. Reply with text instead." };
+            return new ChatToolResult("No suitable meme is available right now, or this conversation is in cooldown. Reply with text instead.");
 
-        return new JsonObject
-        {
-            ["content"] = new JsonObject
-            {
-                ["status"] = "selected",
-                ["caption"] = selection.Caption,
-                ["tags"] = new JsonArray([.. selection.Tags.Select(tag => (JsonNode?)tag)]),
-                ["note"] = "The meme is sent after your reply. Keep the reply to one short sentence; do not describe the image."
-            }.ToJsonString(),
-            ["after_reply"] = new JsonObject
-            {
-                ["service"] = "meme.send",
-                ["arguments"] = new JsonObject { ["id"] = selection.Id, ["caption"] = JsonString(arguments?["caption"]) }
-            }
-        };
+        var content = $"Selected a meme ({selection.Caption}; tags: {string.Join(", ", selection.Tags)}). " +
+                      "It is sent after your reply. Keep the reply to one short sentence; do not describe the image.";
+        return new ChatToolResult(content,
+            new ChatAfterReply(ChatToolName, PluginJson.ToNode(new SendMemeArgs(selection.Id, args?.Caption))!.AsObject()));
     }
 
     /// <summary>
-    /// meme.send：发送 <c>arguments.id</c> 的表情到 <c>context</c> 所在会话。调用方已经发了文字时只发图；
-    /// 没发文字时带上配文，并按 <c>reply.mention</c> / <c>reply.quote</c> @、引用。
+    /// 回复后发送选中的表情。AI 聊天已经发了文字时只发图；没发文字时带上配文，并按 Reply.Mention / Reply.Quote @、引用。
     /// </summary>
-    private async Task<JsonNode?> HandleSendServiceAsync(JsonNode? input, CancellationToken cancellationToken)
+    private async Task<ChatAfterReplyResult> HandleAfterReplyAsync(ChatAfterReplyCall call, CancellationToken cancellationToken)
     {
-        var arguments = input?["arguments"];
-        var context = input?["context"];
-        var reply = input?["reply"];
-        var selection = _store?.GetById(JsonString(arguments?["id"]) ?? "");
-        if (selection is null) return new JsonObject { ["ok"] = false, ["error"] = "未找到该表情" };
+        var args = call.Arguments.As<SendMemeArgs>();
+        var selection = args is null ? null : _store?.GetById(args.Id);
+        if (selection is null) return new ChatAfterReplyResult(false, "未找到该表情");
 
-        var textSent = JsonBool(reply?["text_sent"]);
-        var caption = textSent ? "" : JsonString(arguments?["caption"])?.Trim() ?? "";
-        var target = new MemeSendTarget(
-            JsonString(context?["platform"]) ?? "",
-            JsonString(context?["instance_id"]),
-            JsonString(context?["channel_type"]) ?? "Group",
-            JsonString(context?["channel_id"]) ?? "",
-            JsonString(context?["message_id"]),
-            JsonString(context?["sender_id"]),
-            JsonBool(context?["is_group"]),
-            JsonBool(reply?["mention"]),
-            JsonBool(reply?["quote"]));
+        var caption = call.Reply.TextSent ? "" : args!.Caption?.Trim() ?? "";
+        var context = call.Context;
+        var target = new MemeSendTarget(context.Platform, context.InstanceId, context.ChannelType, context.ChannelId,
+            context.MessageId, context.SenderId, context.IsGroup, call.Reply.Mention, call.Reply.Quote);
         var result = await SendAsync(selection, target, caption, cancellationToken).ConfigureAwait(false);
-        return new JsonObject
-        {
-            ["ok"] = result.Success,
-            ["error"] = result.Error,
-            ["history"] = result.Success ? caption.Length > 0 ? caption : $"[表情：{selection.Caption}]" : null
-        };
+        return new ChatAfterReplyResult(result.Success, result.Error,
+            result.Success ? caption.Length > 0 ? caption : $"[表情：{selection.Caption}]" : null);
     }
-
-    private static string? JsonString(JsonNode? node) =>
-        node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
-
-    private static bool JsonBool(JsonNode? node) =>
-        node is JsonValue value && value.TryGetValue<bool>(out var flag) && flag;
 
     public async Task<MemeSelection?> SelectAsync(MemeQuery query, CancellationToken cancellationToken = default)
     {

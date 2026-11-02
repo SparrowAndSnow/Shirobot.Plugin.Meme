@@ -59,3 +59,15 @@ public sealed record MarketFaceInfo(
     string? Key = null,
     string? Summary = null,
     string? Url = null);
+
+/// <summary>send_meme 工具的参数，[Description] 会成为模型看到的参数说明。</summary>
+[global::ShiroBot.SDK.Plugin.PluginJson]
+public sealed record SendMemeToolArgs(
+    [property: global::System.ComponentModel.Description("Short Chinese keyword(s) describing the desired meme, e.g. 猫, 无语, 大笑, 摸鱼.")] string? Query = null,
+    [property: global::System.ComponentModel.Description("Optional emotion category: happy, sad, angry, confused, shy or daily.")] string? Emotion = null,
+    [property: global::System.ComponentModel.Description("Optional short caption, used only when you write no reply text.")] string? Caption = null);
+
+/// <summary>选中的表情，交给回复后动作发送。</summary>
+[global::ShiroBot.SDK.Plugin.PluginJson]
+public sealed record SendMemeArgs(string Id, string? Caption = null);
+
