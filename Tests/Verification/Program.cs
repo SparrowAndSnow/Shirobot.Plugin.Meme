@@ -132,6 +132,31 @@ var png = Convert.FromBase64String(
           parsed.Tags.Contains("猫") && !parsed.Tags.Contains("表情包") &&
           parsed.Emotions.Contains("happy") && parsed.IsMeme, "AI tagger parses JSON, kind and filters generic tags");
     Check(MemeAiTagger.Parse("{\"choices\":[]}", config) is null, "AI tagger rejects empty choices");
+    Check(MemeAiTagger.ParseContent("好的，结果如下：{\"caption\":\"狗\",\"tags\":[\"狗\"],\"kind\":\"meme\"} 以上", config)?.Caption == "狗",
+        "AI tagger finds the JSON after leading text");
+
+    // 模型来源：auto 有接口地址时用自己的接口，否则借用 AI 聊天插件；aichat / custom 固定。
+    Check(MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "auto", AiBaseUrl = "http://x/v1" }) &&
+          !MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "auto" }) &&
+          !MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "aichat", AiBaseUrl = "http://x/v1" }) &&
+          MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "custom" }),
+        "AI tagger picks its model source from ai_provider");
+
+    var borrowed = new MemeSection { AiTaggingEnabled = true, AiMaxTags = 8, AiInferEmotions = true, AiModel = "vision" };
+    using var tagger = new MemeAiTagger(borrowed, new NetworkSection());
+    Check(!tagger.IsConfigured, "Borrowing AIChat needs the AIChat bridge");
+    (string Prompt, byte[] Image, string Mime, string? Model)? asked = null;
+    tagger.AiChat = (prompt, image, mime, model, _) =>
+    {
+        asked = (prompt, image, mime, model);
+        return Task.FromResult<string?>("{\"caption\":\"猫\",\"tags\":[\"猫\"],\"emotions\":[\"happy\"],\"kind\":\"meme\"}");
+    };
+    var tags = await tagger.TagAsync([1, 2, 3], "image/png", "上下文");
+    Check(tagger.IsConfigured && tags is { Caption: "猫", IsMeme: true } && asked is { Mime: "image/png", Model: "vision" } &&
+          asked.Value.Image.Length == 3 && asked.Value.Prompt.Contains("上下文"),
+        "AI tagger borrows the AIChat model with the image, prompt and configured model");
+    tagger.AiChat = (_, _, _, _, _) => Task.FromResult<string?>(null);
+    Check(await tagger.TagAsync([1], "image/png", "") is null, "AI tagger skips tagging while AIChat is missing");
 }
 
 // ---- ingest queue ----

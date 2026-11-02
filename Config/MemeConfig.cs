@@ -81,13 +81,16 @@ public sealed class MemeSection
     [ConfigField("启用 AI 视觉标注：让多模态模型识别表情内容，生成描述、标签和情绪；失败时回退本地规则。", Label = "AI 标注", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50, GroupDescription = "视觉模型接口、标签和表情过滤。")]
     public bool AiTaggingEnabled { get; set; }
 
-    [ConfigField("OpenAI 兼容视觉接口，例如 http://10.157.0.10:8888/v1；留空则跳过 AI 标注。", Label = "AI 接口地址", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    [ConfigField("模型来源：auto 填了接口地址就用自己的接口，否则借用 AI 聊天插件的模型；aichat 只借用 AI 聊天插件的模型；custom 只用自己的接口。", Label = "模型来源", Options = new[] { "auto", "aichat", "custom" }, Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    public string AiProvider { get; set; } = "auto";
+
+    [ConfigField("自己的 OpenAI 兼容视觉接口，例如 http://10.157.0.10:8888/v1；借用 AI 聊天插件的模型时留空。", Label = "AI 接口地址", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiBaseUrl { get; set; } = "";
 
     [ConfigField("AI API Key；本地免鉴权服务可留空。", Label = "AI API Key", Type = "password", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiApiKey { get; set; } = "";
 
-    [ConfigField("支持图片输入的模型名，例如 DeepSeek-v4.1-Flash-EXL3。", Label = "AI 模型", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    [ConfigField("支持图片输入的模型名。用自己的接口时必填；借用 AI 聊天插件时可留空，由它选一个识图模型。", Label = "AI 模型", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiModel { get; set; } = "";
 
     [ConfigField("AI 标注请求超时秒数。", Label = "AI 超时（秒）", Min = 5, Max = 120, Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]

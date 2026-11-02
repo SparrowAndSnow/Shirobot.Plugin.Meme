@@ -66,9 +66,10 @@ library_token = ""         # 可选：浏览器直接打开管理页用的令牌
 ai_tool_enabled = true     # 向 AI 聊天插件提供 send_meme 工具
 ai_tool_policy = "explicit" # explicit：用户明确要求时才发；auto：轻松聊天时主动配图
 ai_tagging_enabled = false # 启用多模态 AI 标注
-ai_base_url = ""           # OpenAI 兼容接口，例如 http://10.157.0.10:8888/v1
+ai_provider = "auto"       # auto：填了 ai_base_url 用自己的接口，否则借用 AI 聊天插件的模型；aichat / custom 固定其一
+ai_base_url = ""           # 自己的 OpenAI 兼容接口，例如 http://10.157.0.10:8888/v1
 ai_api_key = ""            # 本地免鉴权可留空
-ai_model = ""              # 支持图片输入的模型名
+ai_model = ""              # 支持图片输入的模型名；借用 AI 聊天插件时可留空，由它选识图模型
 ai_timeout_seconds = 30
 ai_max_tags = 8
 ai_infer_emotions = true
@@ -106,7 +107,8 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 其他人无法读取或删除。独立管理页 `/plugin/MemePlugin/library` 需要设置 `library_token` 后用
 `?token=<令牌>` 打开；列表里的图片地址带一小时有效的签名。
 
-启用 `ai_tagging_enabled` 并配置接口/模型后，新采集的图片会由多模态模型生成描述、标签和情绪；
+启用 `ai_tagging_enabled` 后，新采集的图片会由多模态模型生成描述、标签和情绪。模型可以借用 AI 聊天插件配置好的
+（通过它的 `ChatModels` 契约，不需要再填接口和密钥），也可以填写自己的接口和模型；
 AI 失败或超时自动回退到本地关键词规则。已有表情可用 `#meme retag` 重新标注空泛标签，
 `#meme retag all` 重新标注全部；AI 会把图片分为 meme/screenshot/photo/other，
 开启 `ai_filter_non_meme` 后自动采集只保留 meme。`#meme clean` 可预览并删除已有截图/照片。

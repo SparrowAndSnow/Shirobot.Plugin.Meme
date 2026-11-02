@@ -49,6 +49,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         ai_tool_enabled = true
         ai_tool_policy = "explicit"
         ai_tagging_enabled = false
+        ai_provider = "auto"
         ai_base_url = ""
         ai_api_key = ""
         ai_model = ""
@@ -162,7 +163,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         await _store.LoadAsync().ConfigureAwait(false);
 
         _downloader = new MemeDownloader(_config.Meme, _config.Network);
-        _tagger = new MemeAiTagger(_config.Meme, _config.Network);
+        _tagger = new MemeAiTagger(_config.Meme, _config.Network) { AiChat = TagWithAiChatModelAsync };
         _queue = new MemeIngestQueue(_store, _downloader, _tagger);
         _sender = new MemeSender(Context, _config.Meme);
 
@@ -565,7 +566,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
 
         if (_tagger is null || !_tagger.IsConfigured)
         {
-            await ReplyTextAsync(message, "AI 标注未配置：请在“表情库设置”里填写 AI 接口地址、模型和 Key。").ConfigureAwait(false);
+            await ReplyTextAsync(message, "AI 标注不可用：请开启 AI 标注，并安装 AI 聊天插件借用它的模型，或在“表情库设置”里填写自己的 AI 接口地址和模型。").ConfigureAwait(false);
             return;
         }
 
@@ -879,6 +880,15 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
     }
 
     private const string ChatToolName = "send_meme";
+
+    /// <summary>借用 AI 聊天插件的识图模型做标注；AI 聊天插件不在时返回 null。</summary>
+    private async Task<string?> TagWithAiChatModelAsync(string prompt, byte[] image, string mime, string? model, CancellationToken cancellationToken)
+    {
+        var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
+            [new ChatModelMessage("user", prompt, [new ChatModelImage(mime, Convert.ToBase64String(image))])],
+            model, NeedsVision: true, MaxOutputTokens: 400, Temperature: 0), cancellationToken).ConfigureAwait(false);
+        return reply?.Text;
+    }
 
     /// <summary>按配置注册或注销聊天工具；说明随使用倾向变化，所以每次重新注册。</summary>
     private void UpdateChatTool()

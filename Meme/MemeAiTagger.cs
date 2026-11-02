@@ -35,18 +35,27 @@ internal sealed class MemeAiTagger : IDisposable
         _http = CreateClient(config, network);
     }
 
+    /// <summary>借用 AI 聊天插件的模型：传入提示词和图片，返回模型的回复；AI 聊天插件不在时返回 null。</summary>
+    public Func<string, byte[], string, string?, CancellationToken, Task<string?>>? AiChat { get; set; }
+
     public bool IsConfigured
     {
         get
         {
             lock (_sync)
             {
-                return _config.AiTaggingEnabled &&
-                       !string.IsNullOrWhiteSpace(_config.AiBaseUrl) &&
-                       !string.IsNullOrWhiteSpace(_config.AiModel);
+                if (!_config.AiTaggingEnabled) return false;
+                return UsesCustomEndpoint(_config)
+                    ? !string.IsNullOrWhiteSpace(_config.AiBaseUrl) && !string.IsNullOrWhiteSpace(_config.AiModel)
+                    : AiChat is not null;
             }
         }
     }
+
+    /// <summary>custom 用自己的接口；auto 填了接口地址时用自己的接口，否则借用 AI 聊天插件。</summary>
+    internal static bool UsesCustomEndpoint(MemeSection config) =>
+        string.Equals(config.AiProvider, "custom", StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(config.AiProvider, "aichat", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(config.AiBaseUrl);
 
     public void UpdateConfig(MemeSection config, NetworkSection network)
     {
@@ -77,6 +86,8 @@ internal sealed class MemeAiTagger : IDisposable
         }
 
         var prompt = BuildPrompt(config, contextText);
+        if (!UsesCustomEndpoint(config)) return await TagWithAiChatAsync(config, prompt, data, mime, cancellationToken).ConfigureAwait(false);
+
         var body = new
         {
             model = config.AiModel,
@@ -139,6 +150,36 @@ internal sealed class MemeAiTagger : IDisposable
         }
     }
 
+    private async Task<MemeAiTags?> TagWithAiChatAsync(MemeSection config, string prompt, byte[] data, string mime,
+        CancellationToken cancellationToken)
+    {
+        var aiChat = AiChat;
+        if (aiChat is null) return null;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.AiTimeoutSeconds, 5, 120)));
+        try
+        {
+            var model = string.IsNullOrWhiteSpace(config.AiModel) ? null : config.AiModel.Trim();
+            var reply = await aiChat(prompt, data, mime, model, timeout.Token).ConfigureAwait(false);
+            if (reply is null)
+            {
+                BotLog.Warning("Meme AI 标注跳过：AI 聊天插件没有加载");
+                return null;
+            }
+            return ParseContent(reply, config);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            BotLog.Warning($"Meme AI 标注超时（{config.AiTimeoutSeconds}s）");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warning($"Meme AI 标注失败：{ex.Message}");
+            return null;
+        }
+    }
+
     private static string BuildPrompt(MemeSection config, string contextText)
     {
         var context = (contextText ?? "").Trim();
@@ -177,13 +218,26 @@ internal sealed class MemeAiTagger : IDisposable
                 message.TryGetProperty("reasoning_content", out var reasoning) &&
                 reasoning.ValueKind == JsonValueKind.String)
                 content = reasoning.GetString();
+            return ParseContent(content, config);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>从模型回复的文本里取出 JSON 标注。</summary>
+    internal static MemeAiTags? ParseContent(string? content, MemeSection config)
+    {
+        try
+        {
             if (string.IsNullOrWhiteSpace(content)) return null;
 
             var start = content.IndexOf('{');
             var end = content.LastIndexOf('}');
             if (start < 0 || end <= start) return null;
 
-            using var payload = JsonDocument.Parse(content[start..(end - start + 1)]);
+            using var payload = JsonDocument.Parse(content[start..(end + 1)]);
             var root = payload.RootElement;
             var caption = root.TryGetProperty("caption", out var captionElement) &&
                           captionElement.ValueKind == JsonValueKind.String
