@@ -197,7 +197,7 @@ internal sealed class MemeDownloader : IDisposable
         return true;
     }
 
-    private static string? SniffMime(ReadOnlySpan<byte> data)
+    internal static string? SniffMime(ReadOnlySpan<byte> data)
     {
         if (data.Length >= 8 &&
             data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47)
