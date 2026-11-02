@@ -1,7 +1,3 @@
-using System.Net;
-using System.Security.Cryptography;
-using System.Text;
-using Microsoft.AspNetCore.Http;
 using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
@@ -25,7 +21,7 @@ namespace ShiroBot.MemePlugin;
     Category = PluginCategory.Media,
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
-public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDashboardTabProvider
+public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDashboardProvider
 {
     private const string CommandPrefix = "#meme";
     private const string DefaultConfig = """
@@ -45,7 +41,6 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         caption_max_chars = 120
         download_timeout_seconds = 15
         library_dir = "memes"
-        library_token = ""
         ai_tool_enabled = true
         ai_tool_policy = "explicit"
         ai_tagging_enabled = false
@@ -73,59 +68,8 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
     private int _retagRunning;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
-    // 图片地址的签名密钥：每次加载重新生成，<img> 无法携带 Dashboard 的鉴权头。
-    private readonly byte[] _imageKey = RandomNumberGenerator.GetBytes(32);
     private IDisposable? _chatTool;
 
-    /// <summary>Dashboard-owned gallery tab; the page itself stays a plugin route.</summary>
-    public IReadOnlyList<DashboardTabDescriptor> Tabs
-    {
-        get
-        {
-            // Dashboard 带 API 密钥请求这些路由（DashboardRequest.IsAuthorized），路径里不需要令牌。
-            return
-            [
-                new DashboardTabDescriptor(
-                    Id: "library",
-                    Label: "表情库",
-                    Kind: DashboardTabKinds.Gallery,
-                    Icon: "photo_library",
-                    Description: "查看已保存的表情，支持按描述、标签或情绪筛选。",
-                    Order: 55,
-                    Source: new DashboardTabSource("/plugin/MemePlugin/library/items"),
-                    Fields: new DashboardTabFields(
-                        Image: "image",
-                        Title: "title",
-                        Description: "description",
-                        Tags: "tags"),
-                    Filters:
-                    [
-                        new DashboardTabFilter("q", "搜索", "text"),
-                        new DashboardTabFilter("tag", "标签", "text"),
-                        new DashboardTabFilter("emotion", "情绪", "select",
-                        [
-                            new DashboardTabFilterOption("happy", "开心"),
-                            new DashboardTabFilterOption("sad", "难过"),
-                            new DashboardTabFilterOption("angry", "生气"),
-                            new DashboardTabFilterOption("confused", "困惑"),
-                            new DashboardTabFilterOption("shy", "害羞"),
-                            new DashboardTabFilterOption("daily", "日常")
-                        ])
-                    ],
-                    Pagination: new DashboardTabPagination("page", "page_size", 24),
-                    Actions:
-                    [
-                        new DashboardTabAction(
-                            "delete",
-                            "删除",
-                            "/plugin/MemePlugin/library/items/delete?id={id}",
-                            "POST",
-                            "确定删除这个表情？",
-                            "danger")
-                    ])
-            ];
-        }
-    }
     private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
 
     protected override Task OnConfigLoadedAsync(MemeConfig config, CancellationToken cancellationToken)
@@ -168,227 +112,8 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         _sender = new MemeSender(Context, _config.Meme);
 
         RegisterChatServices();
-        RegisterLibraryRoutes();
         BotLog.Info($"MemePlugin 已加载，表情库：{root}");
     }
-
-    private void RegisterLibraryRoutes()
-    {
-        var webHost = Context?.WebHost;
-        if (webHost is null || !webHost.IsEnabled) return;
-        try
-        {
-            webHost.MapGet("MemePlugin", "library", ServeLibraryPageAsync);
-            webHost.MapGet("MemePlugin", "library/image", ServeLibraryImage);
-            webHost.MapGet("MemePlugin", "library/items", ServeLibraryItemsAsync);
-            webHost.MapPost("MemePlugin", "library/items/delete", ServeLibraryDeleteAsync);
-        }
-        catch (Exception ex)
-        {
-            BotLog.Warning($"Meme 管理页路由注册失败：{ex.Message}");
-        }
-    }
-
-    private Task<IResult> ServeLibraryPageAsync(HttpContext context)
-    {
-        // 浏览器直接打开的页面带不了 Dashboard 的鉴权头，只能用令牌；没设令牌时请在 Dashboard 中查看。
-        if (!IsLibraryAuthorized(context))
-            return Task.FromResult(Results.Text("请在 Dashboard 的插件配置中查看表情库，或设置 library_token 后用 ?token= 打开此页面。",
-                "text/plain; charset=utf-8", statusCode: StatusCodes.Status403Forbidden));
-        var store = _store;
-        if (store is null) return Task.FromResult(Results.Text("表情库未加载。", "text/plain; charset=utf-8"));
-
-        var query = context.Request.Query["q"].ToString().Trim();
-        var items = store.GetItems()
-            .Where(item => query.Length == 0 ||
-                           item.Caption.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                           item.Tags.Any(tag => tag.Contains(query, StringComparison.OrdinalIgnoreCase)) ||
-                           item.Emotions.Any(emotion => emotion.Contains(query, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(item => item.CreatedAt)
-            .ToList();
-        var stats = store.GetStats();
-
-        var html = new StringBuilder();
-        html.Append("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">")
-            .Append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">")
-            .Append("<title>表情库 - MemePlugin</title><style>")
-            .Append(":root{color-scheme:light dark;--bg:#f6f4ef;--card:#fff;--text:#1b1b1f;--muted:#68666f;--line:#dedad2;--accent:#5b5bd6}")
-            .Append("@media(prefers-color-scheme:dark){:root{--bg:#17171a;--card:#222226;--text:#f0eef4;--muted:#a9a6b2;--line:#39383f;--accent:#9b9bff}}")
-            .Append("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}")
-            .Append("header{position:sticky;top:0;z-index:2;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:14px 18px}")
-            .Append("h1{margin:0;font-size:20px} .sub{color:var(--muted);font-size:12px;margin-top:3px}")
-            .Append("form{display:flex;gap:8px;margin-top:10px} input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);padding:8px 10px}")
-            .Append("button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:8px 14px;cursor:pointer}")
-            .Append("main{padding:18px;max-width:1400px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}")
-            .Append(".card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}")
-            .Append(".thumb{display:block;width:100%;height:180px;object-fit:contain;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 50%/20px 20px}")
-            .Append(".meta{padding:9px 10px;display:flex;flex-direction:column;gap:3px}.cap{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}")
-            .Append(".tag{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.id{font:11px ui-monospace,monospace;color:var(--muted)}")
-            .Append(".empty{color:var(--muted);padding:60px 0;text-align:center}</style></head><body>")
-            .Append("<header><h1>表情库</h1><div class=\"sub\">共 ").Append(stats.Count).Append(" 张 · ")
-            .Append(stats.Bytes / 1024.0 / 1024.0).Append(" MB")
-            .Append(query.Length == 0 ? "" : " · 当前筛选 " + WebUtility.HtmlEncode(query) + "：" + items.Count + " 张")
-            .Append("</div><form method=\"get\">")
-            .Append(context.Request.Query.ContainsKey("token")
-                ? "<input type=\"hidden\" name=\"token\" value=\"" + WebUtility.HtmlEncode(context.Request.Query["token"].ToString()) + "\">"
-                : "")
-            .Append("<input name=\"q\" value=\"").Append(WebUtility.HtmlEncode(query))
-            .Append("\" placeholder=\"按描述/标签/情绪筛选\"><button type=\"submit\">筛选</button></form></header><main>");
-        if (items.Count == 0)
-        {
-            html.Append("<div class=\"empty\">没有匹配的表情。</div>");
-        }
-        else
-        {
-            html.Append("<div class=\"grid\">");
-            foreach (var item in items)
-            {
-                var imageUrl = ImageUrl(item.Id);
-                html.Append("<article class=\"card\"><img class=\"thumb\" loading=\"lazy\" src=\"")
-                    .Append(WebUtility.HtmlEncode(imageUrl)).Append("\" alt=\"")
-                    .Append(WebUtility.HtmlEncode(item.Caption)).Append("\">")
-                    .Append("<div class=\"meta\"><div class=\"cap\" title=\"")
-                    .Append(WebUtility.HtmlEncode(item.Caption)).Append("\">")
-                    .Append(WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption)).Append("</div>")
-                    .Append("<div class=\"tag\">").Append(WebUtility.HtmlEncode(string.Join(" · ", item.Tags.Take(4)))).Append("</div>")
-                    .Append("<div class=\"id\">").Append(WebUtility.HtmlEncode(item.Id[..Math.Min(8, item.Id.Length)]))
-                    .Append(" · 使用 ").Append(item.UseCount).Append(" 次</div></div></article>");
-            }
-            html.Append("</div>");
-        }
-        html.Append("</main></body></html>");
-        return Task.FromResult(Results.Content(html.ToString(), "text/html; charset=utf-8"));
-    }
-
-    private Task<IResult> ServeLibraryItemsAsync(HttpContext context)
-    {
-        if (!IsLibraryAuthorized(context)) return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
-        var store = _store;
-        if (store is null)
-            return Task.FromResult(Results.Json(new { error = "library_not_ready", message = "表情库未加载。" }, statusCode: StatusCodes.Status503ServiceUnavailable));
-
-        var query = context.Request.Query["q"].ToString().Trim();
-        var tag = context.Request.Query["tag"].ToString().Trim();
-        var emotion = context.Request.Query["emotion"].ToString().Trim();
-        var page = ParsePositiveInt(context, "page", 1);
-        var pageSize = Math.Clamp(ParsePositiveInt(context, "page_size", 24), 1, 100);
-
-        var matching = store.GetItems()
-            .Where(item => query.Length == 0 ||
-                           item.Caption.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                           item.Tags.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)) ||
-                           item.Emotions.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)))
-            .Where(item => tag.Length == 0 ||
-                           item.Tags.Any(value => string.Equals(value, tag, StringComparison.OrdinalIgnoreCase)))
-            .Where(item => emotion.Length == 0 ||
-                           item.Emotions.Any(value => string.Equals(value, emotion, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(item => item.CreatedAt)
-            .ToList();
-
-        var total = matching.Count;
-        var pageItems = matching
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .Select(item =>
-            {
-                var description = item.Emotions.Count > 0
-                    ? string.Join(" · ", item.Emotions)
-                    : string.Join(" · ", item.Tags.Take(4));
-                return new
-                {
-                    id = item.Id,
-                    title = string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption,
-                    description,
-                    image = ImageUrl(item.Id),
-                    tags = item.Tags,
-                    values = new
-                    {
-                        kind = item.Kind,
-                        bytes = item.Bytes,
-                        created_at = item.CreatedAt,
-                        use_count = item.UseCount,
-                        emotions = item.Emotions
-                    },
-                    actions = new[] { "delete" }
-                };
-            })
-            .ToArray();
-
-        return Task.FromResult(Results.Json(new
-        {
-            items = pageItems,
-            total,
-            page,
-            page_size = pageSize,
-            has_more = (long)page * pageSize < total
-        }));
-    }
-
-    private async Task<IResult> ServeLibraryDeleteAsync(HttpContext context)
-    {
-        if (!IsLibraryAuthorized(context)) return Results.StatusCode(StatusCodes.Status403Forbidden);
-        var store = _store;
-        if (store is null)
-            return Results.Json(new { ok = false, message = "表情库未加载。" }, statusCode: StatusCodes.Status503ServiceUnavailable);
-
-        var id = context.Request.Query["id"].ToString();
-        if (string.IsNullOrWhiteSpace(id))
-            return Results.Json(new { ok = false, message = "缺少 id。" }, statusCode: StatusCodes.Status400BadRequest);
-
-        var removed = await store.RemoveAsync(id).ConfigureAwait(false);
-        return Results.Json(new { ok = removed, message = removed ? "已删除。" : "未找到该表情。" },
-            statusCode: removed ? StatusCodes.Status200OK : StatusCodes.Status404NotFound);
-    }
-
-    private static int ParsePositiveInt(HttpContext context, string key, int fallback)
-    {
-        return int.TryParse(context.Request.Query[key].ToString(), out var value) && value > 0
-            ? value
-            : fallback;
-    }
-
-    private Task<IResult> ServeLibraryImage(HttpContext context)
-    {
-        var id = context.Request.Query["id"].ToString();
-        if (!IsLibraryAuthorized(context) && !ImageSignatureValid(context, id))
-            return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
-        var selection = _store?.GetById(id);
-        if (selection is null || !File.Exists(selection.FilePath))
-            return Task.FromResult(Results.NotFound());
-        return Task.FromResult(Results.File(selection.FilePath, selection.Mime, enableRangeProcessing: true));
-    }
-
-    /// <summary>
-    /// 来自已登录 Dashboard 的请求，或带了已配置的 library_token。插件路由是公开的，
-    /// 没设令牌时只有 Dashboard 能读取和删除表情。
-    /// </summary>
-    private bool IsLibraryAuthorized(HttpContext context)
-    {
-        if (DashboardRequest.IsAuthorized(context)) return true;
-        var configured = _config.Meme.LibraryToken;
-        if (string.IsNullOrWhiteSpace(configured)) return false;
-        var supplied = Encoding.UTF8.GetBytes(context.Request.Query["token"].ToString());
-        return CryptographicOperations.FixedTimeEquals(supplied, Encoding.UTF8.GetBytes(configured));
-    }
-
-    /// <summary>列表和管理页里的图片地址，带一小时有效的签名，供 &lt;img&gt; 直接加载。</summary>
-    private string ImageUrl(string id)
-    {
-        var expires = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds();
-        return "/plugin/MemePlugin/library/image?id=" + Uri.EscapeDataString(id) +
-               "&exp=" + expires + "&sig=" + ImageSignature(id, expires);
-    }
-
-    private bool ImageSignatureValid(HttpContext context, string id)
-    {
-        if (!long.TryParse(context.Request.Query["exp"].ToString(), out var expires) ||
-            expires < DateTimeOffset.UtcNow.ToUnixTimeSeconds()) return false;
-        var supplied = Encoding.ASCII.GetBytes(context.Request.Query["sig"].ToString());
-        return CryptographicOperations.FixedTimeEquals(supplied, Encoding.ASCII.GetBytes(ImageSignature(id, expires)));
-    }
-
-    private string ImageSignature(string id, long expires) =>
-        Convert.ToHexStringLower(HMACSHA256.HashData(_imageKey, Encoding.UTF8.GetBytes(id + "\n" + expires)));
 
     protected override async Task OnUnloadAsync()
     {

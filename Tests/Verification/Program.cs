@@ -6,6 +6,7 @@ using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Config;
+using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
@@ -375,6 +376,27 @@ var png = Convert.FromBase64String(
 
     var stats = await plugin.GetStatsAsync();
     Check(stats.Count == 1, "plugin stats");
+    // Dashboard uses the host contract, with no public library routes or signed image URLs.
+    var dashboard = (IPluginDashboardProvider)plugin;
+    Check(dashboard.Pages is [{ Id: "library", Kind: "gallery" }], "independent library dashboard page");
+    var gallery = await dashboard.QueryAsync("library", new DashboardQuery(1, 1,
+        new Dictionary<string, string> { ["q"] = "猫", ["emotion"] = "happy", ["tag"] = "猫" }));
+    Check(gallery is { Total: 1, HasMore: false, Items.Count: 1 } && gallery.Items[0].ImageFileId == item!.Id &&
+          gallery.Items[0].Actions!.Contains("delete"), "dashboard filters and opaque file IDs");
+    var empty = await dashboard.QueryAsync("library", new DashboardQuery(int.MaxValue, 100, new Dictionary<string, string>()));
+    Check(empty.Items.Count == 0 && empty.Total == 1, "dashboard page overflow does not wrap to the first page");
+    var found = await dashboard.GetItemAsync("library", item!.Id);
+    Check(found?.Id == item.Id && await dashboard.GetItemAsync("library", "missing") is null,
+        "dashboard action lookup requires an existing exact ID");
+    var image = await dashboard.OpenFileAsync("library", item.Id);
+    Check(image?.Path == selection!.FilePath && image.ContentType == "image/png", "dashboard image is served through host file API");
+    Check(!(await dashboard.RunActionAsync("library", "unknown", item.Id)).Ok &&
+          !(await dashboard.RunActionAsync("library", "delete", item.Id[..8])).Ok,
+        "dashboard rejects unknown actions and abbreviated IDs");
+    var deleted = await dashboard.RunActionAsync("library", "delete", item.Id);
+    Check(deleted is { Ok: true, Refresh: true } && await dashboard.GetItemAsync("library", item.Id) is null &&
+          await dashboard.OpenFileAsync("library", item.Id) is null, "dashboard delete refreshes and removes image");
+
     await plugin.OnUnload();
     Check(File.Exists(Path.Combine(root, "config.toml")), "default config template written");
 }

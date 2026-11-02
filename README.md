@@ -62,7 +62,6 @@ send_mode = "auto"         # auto / sticker / image
 caption_max_chars = 120
 download_timeout_seconds = 15
 library_dir = "memes"
-library_token = ""         # 可选：浏览器直接打开管理页用的令牌；留空时只能在 Dashboard 查看
 ai_tool_enabled = true     # 向 AI 聊天插件提供 send_meme 工具
 ai_tool_policy = "explicit" # explicit：用户明确要求时才发；auto：轻松聊天时主动配图
 ai_tagging_enabled = false # 启用多模态 AI 标注
@@ -103,9 +102,9 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 #meme clean [confirm]    管理员：预览/删除 AI 判定为截图、照片的内容
 ```
 
-插件配置弹窗里新增“表情库”标签，可直接查看和删除已保存的表情；这些请求由 Dashboard 带鉴权发出，
-其他人无法读取或删除。独立管理页 `/plugin/MemePlugin/library` 需要设置 `library_token` 后用
-`?token=<令牌>` 打开；列表里的图片地址带一小时有效的签名。
+在 Dashboard 的插件详情里打开独立的“页面”窗口，再选择“表情库”，可以搜索、按标签和情绪筛选、分页查看和删除表情。
+此功能使用宿主 1.0.3 的 `IPluginDashboardProvider`，与配置表单分开；列表、操作和图片全部走宿主统一鉴权的 API。
+插件不再注册 `/plugin/MemePlugin/library/...` 公开管理路由，旧 `library_token` 不再使用，也不再生成签名图片链接。
 
 启用 `ai_tagging_enabled` 后，新采集的图片会由多模态模型生成描述、标签和情绪。模型可以借用 AI 聊天插件配置好的
 （通过它的 `ChatModels` 契约，不需要再填接口和密钥），也可以填写自己的接口和模型；
@@ -115,32 +114,12 @@ AI 失败或超时自动回退到本地关键词规则。已有表情可用 `#me
 
 ## 与 AI 聊天插件配合
 
-AI 聊天插件通过共享契约获取 `IMemeService`，并在轻松聊天时向模型提供 `send_meme`
-工具。工具只负责“选图”，最终由 AI 回复管线调用 `IMemeService.SendAsync` 发送，
-避免工具副作用和空回复。
+Meme 通过 AIChat 的 `ChatTools` 契约提供 `chat.tool.send_meme` 和 `chat.after_reply.send_meme`。
+工具负责选图，AIChat 发完文字后调用回复后动作发图；运行时只交换 JSON，不共享服务对象。
+Meme 的 AI 标注通过 `ChatModels` 契约借用 AIChat 的识图模型，与 Dashboard 页面接口互相独立。
 
-AI 聊天配置中：
-
-```toml
-[tool_use.meme]
-enabled = true
-allow_proactive = false
-allow_direct = true
-```
-
-如果 MemePlugin 未安装/未启用，AI 聊天插件会自动跳过该工具。
-
-注意：AI 聊天的 `behaviour.reply_mode` 默认是 `answer`，该模式不会提供表情工具；
-要启用 AI 发表情，请改为 `chat` 或 `auto`。`#meme` 命令不受此限制。
-
-## OneBot / Milky 适配器兼容
-
-- 入站：优先识别 QQ 适配器的 `QIncomingMarketFace` / `QIncomingImage`；普通适配器只提供
-  `ImageSegment` 时，`auto_collect="all"` 或 `#meme save` 仍可收录。
-- 出站：优先走通用 `ImageSegment`（`base64://`），OneBot/Milky 一般都能转发；
-  QQ 适配器可用时再尝试 `QOutgoingImage.SubType="sticker"`。
-- 部分适配器不填 `QIncomingImage.SubType`，插件会先下载再按 GIF/WebP MIME 判断是否为表情；
-  这也意味着 `auto_collect="sticker"` 会对未知类型图片做一次受大小限制的下载。
+这项工具由 Meme 的 `ai_tool_enabled` 和 `ai_tool_policy` 控制。AIChat 按 `ChatTools` 契约发现工具，
+没有安装 Meme 时也可以正常聊天；无需配置已经移除的 `[tool_use.meme]` 专用桥接。
 
 ## QQ 商城表情说明
 
@@ -168,7 +147,7 @@ dotnet build Tests/Verification/Verification.csproj -c Debug
 dotnet Tests/Verification/bin/Debug/net10.0/ShiroBot.MemePlugin.Verification.dll
 ```
 
-覆盖：存储/去重/检索/标签/损坏索引、采集过滤、插件生命周期、按名称服务、发送段和冷却。
+覆盖：存储/去重/检索/标签/损坏索引、采集过滤、插件生命周期、契约工具与回复后动作、发送段和冷却，以及独立 Dashboard 页面的筛选、分页、精确条目校验、图片和删除。
 
 ## 发布注意
 

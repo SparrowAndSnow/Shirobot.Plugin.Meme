@@ -69,9 +69,6 @@ public sealed class MemeSection
     [ConfigField("表情文件存放目录，相对插件目录。", Label = "存储目录", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
     public string LibraryDir { get; set; } = "memes";
 
-    [ConfigField("可选：在浏览器直接打开管理页（/plugin/MemePlugin/library?token=…）用的令牌。留空时管理页关闭，只能在 Dashboard 中查看和删除表情。", Label = "管理页访问令牌", Type = "password", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
-    public string LibraryToken { get; set; } = "";
-
     [ConfigField("向 AI 聊天等插件提供 send_meme 工具（需要宿主 1.0.3）；关闭后它们不会再发表情。", Label = "提供 AI 表情工具", Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45, GroupDescription = "给 AI 聊天插件使用的表情工具。")]
     public bool AiToolEnabled { get; set; } = true;
 
