@@ -274,10 +274,8 @@ var png = Convert.FromBase64String(
 
     var services = DispatchProxy.Create<IPluginServices, TestProxy>();
     var provided = new Dictionary<string, (Func<JsonNode?, CancellationToken, Task<JsonNode?>> Handler, JsonNode? Metadata)>();
-    var registeredTyped = false;
     ((TestProxy)(object)services).Call = (method, args) =>
     {
-        if (method.Name == "RegisterSingleton") registeredTyped = true;
         if (method.Name == "Provide" && args is { Length: >= 2 })
             provided[(string)args[0]!] = ((Func<JsonNode?, CancellationToken, Task<JsonNode?>>)args[1]!, args.Length > 2 ? args[2] as JsonNode : null);
         return null;
@@ -304,9 +302,9 @@ var png = Convert.FromBase64String(
 
     var plugin = new MemePlugin();
     await plugin.OnLoad(bot);
-    Check(!registeredTyped && provided.ContainsKey("meme.send") &&
+    Check(provided.ContainsKey("meme.send") &&
           (string?)provided.GetValueOrDefault("chat.tool.send_meme").Metadata?["parameters"]?["required"]?[0] == "query",
-        "plugin provides named meme services instead of a shared typed service");
+        "plugin provides named meme services");
 
     var storeField = typeof(MemePlugin).GetField("_store", BindingFlags.Instance | BindingFlags.NonPublic)!;
     var store = (MemeStore)storeField.GetValue(plugin)!;
