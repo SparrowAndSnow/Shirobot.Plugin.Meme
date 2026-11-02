@@ -1,7 +1,7 @@
 # ShiroBot MemePlugin
 
 独立的表情包插件：本地表情库、群聊自动采集（“盗图”）、QQ 商城表情入库、
-按关键词/情绪检索，并通过共享契约向 AI 聊天插件提供 `send_meme` 能力。
+按关键词/情绪检索，向 AI 聊天插件提供 `send_meme`，并通过 `MemeLibrary` 契约供其他插件选图、发图和查询容量。
 
 ## 能力
 
@@ -30,14 +30,51 @@ dotnet publish ShiroBot.MemePlugin.csproj -c Release
 ShiroBot.MemePlugin.dll
 ```
 
+这是合并后的单文件插件，`StbImageSharp` 等私有托管依赖已合入这个 DLL。安装只取上述 **Release publish** 成品；
+Debug 和未合并的中间输出用于开发，不能作为发布文件。无需另装 `StbImageSharp.dll` 或单独的契约 DLL。
+
 ### AI 聊天插件的契约
 
-`contracts/ShiroBot.AiChatPlugin.dll` 是 AI 聊天插件的 DLL，只在构建时读取它的契约（`ChatTools` 等类型），
-不会被引用，也不会进入本插件的成品。AI 聊天插件的契约变化时，换成新版 DLL 重新构建即可。
+源码目录里的 `contracts/ShiroBot.AiChatPlugin.dll` 是 **构建输入**，只在编译时读取 `ChatTools` / `ChatModels` 契约并生成本地代码，
+不是 Meme 的第二个安装文件，不会被运行时引用或进入发布目录。AI 聊天插件的契约变化时，换成新版 DLL 重新构建即可。
 
 ## 安装
 
-把 DLL 放到 `ShiroBot/plugins/MemePlugin/`。和 AI 聊天插件一起使用时不需要复制任何其他文件。
+只把 `ShiroBot.MemePlugin.dll` 放到 `ShiroBot/plugins/MemePlugin/`。
+需要 AI 聊天/借用模型时，将 AIChat 自己的单文件插件独立安装到 `plugins/AiChatPlugin/`，不要复制到 Meme 目录。
+
+## 供其他插件调用
+
+Meme 自己导出 `[PluginContract]`：`ShiroBot.MemePlugin.Contracts.MemeLibrary`。
+把已发布的 `ShiroBot.MemePlugin.dll` 放进调用方项目的 `contracts/`，SDK 会生成契约类型和 JSON 读写代码。
+契约就包含在同一个插件 DLL 内，无需第二个 contracts DLL，也不要添加运行时 `<Reference>` 或 `SharedAssemblies`。
+
+| 契约 | 服务名 | 用途 |
+| --- | --- | --- |
+| `MemeLibrary.Select` | `meme.select` | 按关键词/情绪选图，返回完整 ID、描述、标签和 MIME；没有本地路径 |
+| `MemeLibrary.Send` | `meme.send` | 传完整 ID 和目标会话，由 Meme 读取库内图片并发送；遵守启用开关、冷却和每小时上限 |
+| `MemeLibrary.Stats` | `meme.stats` | 查询启用状态、数量、字节数和更新时间 |
+
+```csharp
+using ShiroBot.MemePlugin.Contracts;
+
+var selected = await MemeLibrary.Select.TryCallAsync(Context,
+    new MemeSelectRequest("猫", ChannelId: message.Channel.Id), ct);
+if (selected?.Meme is { } meme)
+{
+    var sent = await MemeLibrary.Send.TryCallAsync(Context,
+        new MemeSendRequest(meme.Id, new MemeDestination(message.Platform,
+            message.Channel.Type.ToString(), message.Channel.Id, message.InstanceId)), ct);
+    // sent?.Ok 表示发送成功；sent?.Error 是未发送的原因。
+}
+var stats = await MemeLibrary.Stats.TryCallAsync(Context, ct);
+```
+
+`TryCallAsync` 返回 null 表示提供方未加载或正在卸载；`Select` 返回 `{ Meme: null }` 表示关闭、冷却或暂无可用图片。
+未命中关键词时沿用插件的随机可用表情回退。`Send` 不接受 ID 前缀或外部文件路径；`ChannelType` 只接受 `Group` / `Direct`。
+这些是宿主进程内的插件服务，不新增公开 HTTP 路由，也不使用 Dashboard API 密钥；与现有插件服务一样，调用方是已安装的受信任插件。
+服务随插件卸载注销，调用方和提供方可独立更新；调用 `MemeLibrary` 不需要安装 AIChat。
+AIChat 专用的工具和回复后动作仍沿用 `ChatTools`。
 
 ## 配置
 
@@ -146,9 +183,14 @@ Meme 的 AI 标注通过 `ChatModels` 契约借用 AIChat 的识图模型，与 
 ```bash
 dotnet build Tests/Verification/Verification.csproj -c Debug
 dotnet Tests/Verification/bin/Debug/net10.0/ShiroBot.MemePlugin.Verification.dll
+
+# 先 Release publish，再从最终的单 DLL 导入契约，验证真实调用方不依赖提供方程序集
+dotnet publish ShiroBot.MemePlugin.csproj -c Release
+dotnet run --project Tests/ContractConsumer -c Release -- bin/Release/net10.0/publish/ShiroBot.MemePlugin.dll
 ```
 
-覆盖：存储/去重/检索/标签/损坏索引、采集过滤、插件生命周期、契约工具与回复后动作、发送段和冷却，以及独立 Dashboard 页面的筛选、分页、精确条目校验、图片和删除。
+覆盖：存储/去重/检索/标签/损坏索引、采集过滤、插件生命周期、公开选图/发图/统计契约、契约工具与回复后动作、发送段和冷却，以及 Dashboard 页面的筛选、分页、精确条目校验、图片、删除和上传。
+发布验证还检查：最终 DLL 可被调用方提取契约、消息往返、调用方无提供方运行时引用、`StbImageSharp` 类型已合并且没有外部依赖、发布目录只有一个 DLL。CI 发布前执行同样的检查。
 
 ## 发布注意
 

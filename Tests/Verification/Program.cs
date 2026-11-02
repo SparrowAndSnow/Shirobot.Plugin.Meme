@@ -3,6 +3,7 @@ using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.MemePlugin;
 using ShiroBot.MemePlugin.Config;
+using ShiroBot.MemePlugin.Contracts;
 using ShiroBot.MemePlugin.Meme;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Config;
@@ -346,6 +347,49 @@ var png = Convert.FromBase64String(
     var item = await store.AddAsync(png, "image/png", "猫猫", ["猫"], ["happy"],
         new MemeSource { Platform = "qq", ChannelId = "g1" }, null);
     Check(item is not null, "plugin store add");
+
+    var contractSelection = await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", ChannelId: "contract-group"));
+    Check(contractSelection?.Meme is { } chosen && chosen.Id == item!.Id && chosen.Mime == "image/png" &&
+          PluginJson.Serialize(contractSelection).AsSpan().IndexOf("file_path"u8) < 0,
+        "exported library contract selects metadata without exposing file paths");
+    var contractTarget = new MemeDestination("qq", "Group", "contract-group", "test", SenderId: "u1", Mention: true);
+    var invalidContractSend = await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+        new MemeSendRequest(item!.Id[..8], contractTarget));
+    Check(invalidContractSend is { Ok: false } && sentSegments.Count == 0,
+        "library contract rejects abbreviated IDs before sending");
+    var invalidTargetSend = await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+        new MemeSendRequest(item.Id, contractTarget with { ChannelType = "invalid" }));
+    Check(invalidTargetSend is { Ok: false } && sentSegments.Count == 0,
+        "library contract rejects invalid destinations");
+    var contractSend = await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+        new MemeSendRequest(item.Id, contractTarget, "契约测试"));
+    Check(contractSend is { Ok: true, MessageId: "sent-1" } && sentSegments.OfType<MentionSegment>().Any(),
+        "exported library contract sends the stored image by ID");
+    Check((await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", ChannelId: "contract-group"))) is { Meme: null },
+        "library contract honors per-conversation cooldown");
+    var statsJson = await provided[MemeLibrary.Stats.Name].Handler(ReadOnlyMemory<byte>.Empty, CancellationToken.None);
+    Check(PluginJson.Deserialize<MemeStats>(statsJson.Span) is { Enabled: true, Count: 1 },
+        "exported library contract provides statistics");
+    config.Meme.Enabled = false;
+    Check((await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", ChannelId: "disabled-group"))) is { Meme: null } &&
+        (await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+            new MemeSendRequest(item.Id, contractTarget with { ChannelId = "disabled-group" }))) is { Ok: false, Error: "表情库未启用" },
+        "disabled library cannot be used through plugin contracts");
+    config.Meme.Enabled = true;
+    using (var canceledContract = new CancellationTokenSource())
+    {
+        canceledContract.Cancel();
+        try
+        {
+            await provided[MemeLibrary.Select.Name].Handler(PluginJson.Serialize(new MemeSelectRequest("猫")), canceledContract.Token);
+            Check(false, "library contract cancellation propagated");
+        }
+        catch (OperationCanceledException) { Check(true, "library contract cancellation propagated"); }
+    }
+    sentSegments.Clear();
 
     var fallback = await plugin.SelectAsync(new MemeQuery("不存在的关键词", ChannelId: "g1"));
     Check(fallback is not null, "plugin selection falls back to library");

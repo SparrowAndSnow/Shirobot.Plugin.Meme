@@ -1,8 +1,8 @@
 namespace ShiroBot.MemePlugin.Meme;
 
 /// <summary>
-/// 表情库的选择与发送。只在插件内部使用；其他插件通过按名称提供的服务
-/// （<c>chat.tool.send_meme</c>、<c>meme.send</c>）交换 JSON，不共享这些类型，因此本插件可以随时热更新。
+/// 表情库内部的选择与发送接口。其他插件使用 Contracts.MemeLibrary，
+/// 按服务名交换 JSON，不共享这里的接口、文件路径或服务对象。
 /// </summary>
 public interface IMemeService
 {

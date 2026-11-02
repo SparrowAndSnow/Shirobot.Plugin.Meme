@@ -111,6 +111,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService, I
         _queue = new MemeIngestQueue(_store, _downloader, _tagger);
         _sender = new MemeSender(Context, _config.Meme);
 
+        RegisterLibraryServices();
         RegisterChatServices();
         BotLog.Info($"MemePlugin 已加载，表情库：{root}");
     }

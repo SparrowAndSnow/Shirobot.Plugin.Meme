@@ -33,6 +33,9 @@ jobs:
       - name: Publish
         run: dotnet publish ShiroBot.MemePlugin.csproj --configuration Release
 
+      - name: Verify exported contracts and single-file dependencies
+        run: dotnet run --project Tests/ContractConsumer -c Release -- "$PUBLISH_DIR/ShiroBot.MemePlugin.dll"
+
       - name: Package plugin ZIP
         shell: bash
         run: |
