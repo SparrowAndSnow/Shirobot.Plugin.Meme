@@ -12,13 +12,13 @@
 - 检索：标签、描述、情绪（happy/sad/angry/confused/shy/daily），支持关键词。
 - 发送：通用 `ImageSegment`；QQ 适配器可用时尝试 `QOutgoingImage.SubType="sticker"`，
   失败自动回退普通图片。
-- 共享服务：`ShiroBot.Meme.Contracts.IMemeService`，供 AI 聊天插件调用。
+- AI 聊天工具：按名称提供 `chat.tool.send_meme`（选图）和 `meme.send`（发送），AI 聊天插件按约定调用，
+  不需要共享程序集；本插件可以随时卸载、更新，不影响 AI 聊天插件。
 - 冷却：每会话冷却和每小时上限，避免刷屏。
 
 ## 构建
 
-需要 .NET 10 SDK。SDK 版本与目标宿主一致；本项目当前引用 `ShiroBot.SDK 1.0.1`，
-宿主 1.0.2 兼容。
+需要 .NET 10 SDK。本项目引用 `ShiroBot.SDK 1.0.3`，需要宿主 1.0.3 及以上。
 
 ```bash
 dotnet publish ShiroBot.MemePlugin.csproj -c Release
@@ -28,25 +28,11 @@ dotnet publish ShiroBot.MemePlugin.csproj -c Release
 
 ```text
 ShiroBot.MemePlugin.dll
-ShiroBot.Meme.Contracts.dll
 ```
-
-> `ShiroBot.Meme.Contracts` 是共享契约程序集，必须和插件 DLL 放在同一个插件目录。
-> 宿主的 `SharedAssemblies` 机制会把它加载到 Default ALC，跨插件服务才能成立。
 
 ## 安装
 
-把两个 DLL 放到：
-
-```text
-ShiroBot/plugins/MemePlugin/
-  ShiroBot.MemePlugin.dll
-  ShiroBot.Meme.Contracts.dll
-```
-
-如果同时使用 AI 聊天插件，`plugins/AiChatPlugin/` 也需要同一个
-`ShiroBot.Meme.Contracts.dll`。**请复制同一个文件**，不要分别从不同构建取契约 DLL；
-宿主会校验共享程序集的 MVID，版本不一致会要求重启或拒绝加载。
+把 DLL 放到 `ShiroBot/plugins/MemePlugin/`。和 AI 聊天插件一起使用时不需要复制任何其他文件。
 
 ## 配置
 
@@ -71,7 +57,9 @@ send_mode = "auto"         # auto / sticker / image
 caption_max_chars = 120
 download_timeout_seconds = 15
 library_dir = "memes"
-library_token = ""         # 可选：管理页/图片接口令牌；留空不校验
+library_token = ""         # 可选：浏览器直接打开管理页用的令牌；留空时只能在 Dashboard 查看
+ai_tool_enabled = true     # 向 AI 聊天插件提供 send_meme 工具
+ai_tool_policy = "explicit" # explicit：用户明确要求时才发；auto：轻松聊天时主动配图
 ai_tagging_enabled = false # 启用多模态 AI 标注
 ai_base_url = ""           # OpenAI 兼容接口，例如 http://10.157.0.10:8888/v1
 ai_api_key = ""            # 本地免鉴权可留空
@@ -109,9 +97,9 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 #meme clean [confirm]    管理员：预览/删除 AI 判定为截图、照片的内容
 ```
 
-插件配置弹窗里新增“表情库”标签，可直接查看已保存的表情；该页面地址为
-`/plugin/MemePlugin/library`，图片接口为 `/plugin/MemePlugin/library/image?id=<ID>`。
-如果设置了 `library_token`，管理页和图片接口都需要带 `token` 查询参数。
+插件配置弹窗里新增“表情库”标签，可直接查看和删除已保存的表情；这些请求由 Dashboard 带鉴权发出，
+其他人无法读取或删除。独立管理页 `/plugin/MemePlugin/library` 需要设置 `library_token` 后用
+`?token=<令牌>` 打开；列表里的图片地址带一小时有效的签名。
 
 启用 `ai_tagging_enabled` 并配置接口/模型后，新采集的图片会由多模态模型生成描述、标签和情绪；
 AI 失败或超时自动回退到本地关键词规则。已有表情可用 `#meme retag` 重新标注空泛标签，
@@ -173,14 +161,11 @@ dotnet build Tests/Verification/Verification.csproj -c Debug
 dotnet Tests/Verification/bin/Debug/net10.0/ShiroBot.MemePlugin.Verification.dll
 ```
 
-覆盖：存储/去重/检索/标签/损坏索引、采集过滤、插件生命周期、服务注册、发送段和冷却。
+覆盖：存储/去重/检索/标签/损坏索引、采集过滤、插件生命周期、按名称服务、发送段和冷却。
 
 ## 发布注意
 
-- `ShiroBot.MemePlugin.dll` 与 `ShiroBot.Meme.Contracts.dll` 必须一起发布。
-- AI 聊天插件的 Release 工作流会 checkout 本仓库的契约项目；如果仓库名/所有者不同，
-  请修改 `.github/workflows/release.yml` 中的 `repository` 和 `MemeContractsProject`。
-- 两个插件发布时应使用**同一次构建**的契约 DLL，避免 MVID 不一致。
+- 只发布 `ShiroBot.MemePlugin.dll`；和 AI 聊天插件之间只约定服务名和 JSON 字段，可以各自独立发布。
 
 ## 许可证
 

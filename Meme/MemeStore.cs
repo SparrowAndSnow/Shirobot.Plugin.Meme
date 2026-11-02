@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using ShiroBot.Meme.Contracts;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Abstractions;

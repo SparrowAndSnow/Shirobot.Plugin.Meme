@@ -1,5 +1,5 @@
 using System.Reflection;
-using ShiroBot.Meme.Contracts;
+using System.Text.Json.Nodes;
 using ShiroBot.MemePlugin;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
@@ -273,11 +273,13 @@ var png = Convert.FromBase64String(
     };
 
     var services = DispatchProxy.Create<IPluginServices, TestProxy>();
-    IMemeService? registered = null;
+    var provided = new Dictionary<string, (Func<JsonNode?, CancellationToken, Task<JsonNode?>> Handler, JsonNode? Metadata)>();
+    var registeredTyped = false;
     ((TestProxy)(object)services).Call = (method, args) =>
     {
-        if (method.Name == "RegisterSingleton" && args is { Length: > 0 })
-            registered = args[0] as IMemeService;
+        if (method.Name == "RegisterSingleton") registeredTyped = true;
+        if (method.Name == "Provide" && args is { Length: >= 2 })
+            provided[(string)args[0]!] = ((Func<JsonNode?, CancellationToken, Task<JsonNode?>>)args[1]!, args.Length > 2 ? args[2] as JsonNode : null);
         return null;
     };
 
@@ -302,7 +304,9 @@ var png = Convert.FromBase64String(
 
     var plugin = new MemePlugin();
     await plugin.OnLoad(bot);
-    Check(registered is not null, "plugin registers IMemeService");
+    Check(!registeredTyped && provided.ContainsKey("meme.send") &&
+          (string?)provided.GetValueOrDefault("chat.tool.send_meme").Metadata?["parameters"]?["required"]?[0] == "query",
+        "plugin provides named meme services instead of a shared typed service");
 
     var storeField = typeof(MemePlugin).GetField("_store", BindingFlags.Instance | BindingFlags.NonPublic)!;
     var store = (MemeStore)storeField.GetValue(plugin)!;
@@ -321,6 +325,29 @@ var png = Convert.FromBase64String(
     Check(sentSegments.OfType<ImageSegment>().Any(), "sender uses image segment");
     Check(sentSegments.OfType<TextSegment>().Any(t => t.Text.Contains("猫猫来了")), "sender includes caption");
     Check((await plugin.SelectAsync(new MemeQuery("猫", ChannelId: "g1"))) is null, "cooldown blocks second select");
+
+    // AI 聊天工具：只选图并要求回复后调用 meme.send；没有文字时带配文、按要求 @。
+    var context = new JsonObject { ["platform"] = "qq", ["instance_id"] = "test", ["channel_type"] = "Group",
+        ["channel_id"] = "g2", ["message_id"] = "m2", ["sender_id"] = "u2", ["is_group"] = true };
+    var sentBefore = sentSegments.Count;
+    var toolResult = await provided["chat.tool.send_meme"].Handler(new JsonObject
+    {
+        ["arguments"] = new JsonObject { ["query"] = "猫", ["caption"] = "喵" },
+        ["context"] = context.DeepClone()
+    }, CancellationToken.None);
+    var after = toolResult?["after_reply"];
+    Check((string?)after?["service"] == "meme.send" && (string?)after?["arguments"]?["id"] == item!.Id &&
+          sentSegments.Count == sentBefore, "send_meme tool selects without sending");
+    sentSegments.Clear();
+    var sendResult = await provided["meme.send"].Handler(new JsonObject
+    {
+        ["arguments"] = after?["arguments"]?.DeepClone(),
+        ["context"] = context.DeepClone(),
+        ["reply"] = new JsonObject { ["text_sent"] = false, ["mention"] = true, ["quote"] = false }
+    }, CancellationToken.None);
+    Check((bool?)sendResult?["ok"] == true && (string?)sendResult?["history"] == "喵" &&
+          sentSegments.OfType<MentionSegment>().Any() && sentSegments.OfType<TextSegment>().Any(t => t.Text.Contains("喵")),
+        "meme.send sends with caption and mention when no reply text was sent");
 
     var stats = await plugin.GetStatsAsync();
     Check(stats.Count == 1, "plugin stats");

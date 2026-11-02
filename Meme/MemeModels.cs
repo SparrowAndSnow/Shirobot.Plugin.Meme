@@ -1,4 +1,3 @@
-using ShiroBot.Meme.Contracts;
 
 namespace ShiroBot.MemePlugin.Meme;
 

@@ -69,8 +69,14 @@ public sealed class MemeSection
     [ConfigField("表情文件存放目录，相对插件目录。", Label = "存储目录", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
     public string LibraryDir { get; set; } = "memes";
 
-    [ConfigField("可选：管理页/图片接口访问令牌；留空表示不校验。设置后需在管理页 URL 带 token。", Label = "管理页访问令牌", Type = "password", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
+    [ConfigField("可选：在浏览器直接打开管理页（/plugin/MemePlugin/library?token=…）用的令牌。留空时管理页关闭，只能在 Dashboard 中查看和删除表情。", Label = "管理页访问令牌", Type = "password", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
     public string LibraryToken { get; set; } = "";
+
+    [ConfigField("向 AI 聊天等插件提供 send_meme 工具（需要宿主 1.0.3）；关闭后它们不会再发表情。", Label = "提供 AI 表情工具", Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45, GroupDescription = "给 AI 聊天插件使用的表情工具。")]
+    public bool AiToolEnabled { get; set; } = true;
+
+    [ConfigField("explicit：只在用户明确要求发表情时使用；auto：轻松聊天时主动配表情。", Label = "使用倾向", Options = new[] { "explicit", "auto" }, Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45)]
+    public string AiToolPolicy { get; set; } = "explicit";
 
     [ConfigField("启用 AI 视觉标注：让多模态模型识别表情内容，生成描述、标签和情绪；失败时回退本地规则。", Label = "AI 标注", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50, GroupDescription = "视觉模型接口、标签和表情过滤。")]
     public bool AiTaggingEnabled { get; set; }

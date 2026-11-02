@@ -1,5 +1,4 @@
 using System.Text.Json.Serialization;
-using ShiroBot.Meme.Contracts;
 
 namespace ShiroBot.MemePlugin.Meme;
 

@@ -1,8 +1,8 @@
-namespace ShiroBot.Meme.Contracts;
+namespace ShiroBot.MemePlugin.Meme;
 
 /// <summary>
-/// 表情包库服务。由 MemePlugin 注册到宿主插件服务表，供其他插件（例如 AI 聊天）调用。
-/// 契约程序集必须作为共享程序集随插件发布，确保所有插件看到同一个接口类型。
+/// 表情库的选择与发送。只在插件内部使用；其他插件通过按名称提供的服务
+/// （<c>chat.tool.send_meme</c>、<c>meme.send</c>）交换 JSON，不共享这些类型，因此本插件可以随时热更新。
 /// </summary>
 public interface IMemeService
 {

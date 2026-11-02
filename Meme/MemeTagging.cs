@@ -1,5 +1,4 @@
 using System.Text.RegularExpressions;
-using ShiroBot.Meme.Contracts;
 
 namespace ShiroBot.MemePlugin.Meme;
 
