@@ -26,7 +26,7 @@
 SHIROBOT_SOURCE=/path/to/ShiroBot
 LOCAL_FEED=/tmp/shirobot-dashboard-sdk
 # 在宿主源码目录打本地测试包，不发布到 NuGet、不打 tag。
-dotnet pack "$SHIROBOT_SOURCE/Packaging/ShiroBot.SDK.Package/ShiroBot.SDK.Package.csproj" -c Release -p:ShiroBotProductVersion=1.0.3-dashboard-ui.3 -o "$LOCAL_FEED"
+dotnet pack "$SHIROBOT_SOURCE/SDK/Packaging/ShiroBot.SDK.Package.csproj" -c Release -p:ShiroBotProductVersion=1.0.3-dashboard-ui.3 -o "$LOCAL_FEED"
 # 回到此插件目录，用测试包还原并构建。
 dotnet restore -p:ShiroBotSdkVersion=1.0.3-dashboard-ui.3 --source "$LOCAL_FEED" --source https://api.nuget.org/v3/index.json
 dotnet publish ShiroBot.MemePlugin.csproj -c Release -p:ShiroBotSdkVersion=1.0.3-dashboard-ui.3 --no-restore
