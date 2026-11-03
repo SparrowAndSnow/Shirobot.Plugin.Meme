@@ -33,23 +33,23 @@ jobs:
       - name: Publish
         run: dotnet publish ShiroBot.MemePlugin.csproj --configuration Release
 
+      - name: Verify exported contracts and single-file dependencies
+        run: dotnet run --project Tests/ContractConsumer -c Release -- "$PUBLISH_DIR/ShiroBot.MemePlugin.dll"
+
       - name: Package plugin ZIP
         shell: bash
         run: |
           PLUGIN_DLL="$PUBLISH_DIR/ShiroBot.MemePlugin.dll"
-          CONTRACT_DLL="$PUBLISH_DIR/ShiroBot.Meme.Contracts.dll"
-          for dll in "$PLUGIN_DLL" "$CONTRACT_DLL"; do
-            if [ ! -f "$dll" ]; then
-              echo "Missing release asset: $dll"
-              ls -la "$PUBLISH_DIR"
-              exit 1
-            fi
-          done
+          if [ ! -f "$PLUGIN_DLL" ]; then
+            echo "Missing release asset: $PLUGIN_DLL"
+            ls -la "$PUBLISH_DIR"
+            exit 1
+          fi
 
           unexpected_dlls=()
           for dll in "$PUBLISH_DIR"/*.dll; do
             [ -e "$dll" ] || continue
-            if [ "$dll" != "$PLUGIN_DLL" ] && [ "$dll" != "$CONTRACT_DLL" ]; then
+            if [ "$dll" != "$PLUGIN_DLL" ]; then
               unexpected_dlls+=("$dll")
             fi
           done
@@ -60,9 +60,9 @@ jobs:
           fi
 
           mkdir -p release
-          cp "$PLUGIN_DLL" "$CONTRACT_DLL" release/
+          cp "$PLUGIN_DLL" release/
           cd release
-          zip -9 ShiroBot.MemePlugin.zip ShiroBot.MemePlugin.dll ShiroBot.Meme.Contracts.dll
+          zip -9 ShiroBot.MemePlugin.zip ShiroBot.MemePlugin.dll
           unzip -l ShiroBot.MemePlugin.zip
 
       - name: Upload plugin ZIP to Release

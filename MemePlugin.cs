@@ -1,7 +1,4 @@
-using System.Net;
-using System.Text;
-using Microsoft.AspNetCore.Http;
-using ShiroBot.Meme.Contracts;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.MemePlugin.Meme;
 using ShiroBot.SDK.Abstractions;
@@ -23,8 +20,8 @@ namespace ShiroBot.MemePlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Media,
     IsPluginSingleFile = true,
-    SharedAssemblies = "ShiroBot.Model.QQ;ShiroBot.Meme.Contracts")]
-public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDashboardTabProvider
+    SharedAssemblies = "ShiroBot.Model.QQ")]
+public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
 {
     private const string CommandPrefix = "#meme";
     private const string DefaultConfig = """
@@ -44,8 +41,10 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         caption_max_chars = 120
         download_timeout_seconds = 15
         library_dir = "memes"
-        library_token = ""
+        ai_tool_enabled = true
+        ai_tool_policy = "explicit"
         ai_tagging_enabled = false
+        ai_provider = "auto"
         ai_base_url = ""
         ai_api_key = ""
         ai_model = ""
@@ -69,60 +68,8 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
     private int _retagRunning;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
+    private IDisposable? _chatTool;
 
-    /// <summary>Dashboard-owned gallery tab; the page itself stays a plugin route.</summary>
-    public IReadOnlyList<DashboardTabDescriptor> Tabs
-    {
-        get
-        {
-            var token = _config.Meme.LibraryToken;
-            var tokenQuery = string.IsNullOrWhiteSpace(token) ? "" : "?token=" + Uri.EscapeDataString(token);
-            var actionPath = "/plugin/MemePlugin/library/items/delete?id={id}";
-            if (!string.IsNullOrWhiteSpace(token)) actionPath += "&token=" + Uri.EscapeDataString(token);
-
-            return
-            [
-                new DashboardTabDescriptor(
-                    Id: "library",
-                    Label: "表情库",
-                    Kind: DashboardTabKinds.Gallery,
-                    Icon: "photo_library",
-                    Description: "查看已保存的表情，支持按描述、标签或情绪筛选。",
-                    Order: 55,
-                    Source: new DashboardTabSource("/plugin/MemePlugin/library/items" + tokenQuery),
-                    Fields: new DashboardTabFields(
-                        Image: "image",
-                        Title: "title",
-                        Description: "description",
-                        Tags: "tags"),
-                    Filters:
-                    [
-                        new DashboardTabFilter("q", "搜索", "text"),
-                        new DashboardTabFilter("tag", "标签", "text"),
-                        new DashboardTabFilter("emotion", "情绪", "select",
-                        [
-                            new DashboardTabFilterOption("happy", "开心"),
-                            new DashboardTabFilterOption("sad", "难过"),
-                            new DashboardTabFilterOption("angry", "生气"),
-                            new DashboardTabFilterOption("confused", "困惑"),
-                            new DashboardTabFilterOption("shy", "害羞"),
-                            new DashboardTabFilterOption("daily", "日常")
-                        ])
-                    ],
-                    Pagination: new DashboardTabPagination("page", "page_size", 24),
-                    Actions:
-                    [
-                        new DashboardTabAction(
-                            "delete",
-                            "删除",
-                            actionPath,
-                            "POST",
-                            "确定删除这个表情？",
-                            "danger")
-                    ])
-            ];
-        }
-    }
     private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
 
     protected override Task OnConfigLoadedAsync(MemeConfig config, CancellationToken cancellationToken)
@@ -138,6 +85,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         if (_sender is not null && Context is not null)
             _sender = new MemeSender(Context, current.Meme);
         _tagger?.UpdateConfig(current.Meme, current.Network);
+        if (_store is not null) UpdateChatTool();
         return Task.CompletedTask;
     }
 
@@ -159,206 +107,14 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
         await _store.LoadAsync().ConfigureAwait(false);
 
         _downloader = new MemeDownloader(_config.Meme, _config.Network);
-        _tagger = new MemeAiTagger(_config.Meme, _config.Network);
+        _tagger = new MemeAiTagger(_config.Meme, _config.Network) { AiChat = TagWithAiChatModelAsync };
         _queue = new MemeIngestQueue(_store, _downloader, _tagger);
         _sender = new MemeSender(Context, _config.Meme);
 
-        Context.Services.RegisterSingleton<IMemeService>(this);
-        RegisterLibraryRoutes();
+        RegisterDashboardPage();
+        RegisterLibraryServices();
+        RegisterChatServices();
         BotLog.Info($"MemePlugin 已加载，表情库：{root}");
-    }
-
-    private void RegisterLibraryRoutes()
-    {
-        var webHost = Context?.WebHost;
-        if (webHost is null || !webHost.IsEnabled) return;
-        try
-        {
-            webHost.MapGet("MemePlugin", "library", ServeLibraryPageAsync);
-            webHost.MapGet("MemePlugin", "library/image", ServeLibraryImage);
-            webHost.MapGet("MemePlugin", "library/items", ServeLibraryItemsAsync);
-            webHost.MapPost("MemePlugin", "library/items/delete", ServeLibraryDeleteAsync);
-        }
-        catch (Exception ex)
-        {
-            BotLog.Warning($"Meme 管理页路由注册失败：{ex.Message}");
-        }
-    }
-
-    private Task<IResult> ServeLibraryPageAsync(HttpContext context)
-    {
-        if (!LibraryTokenMatches(context)) return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
-        var store = _store;
-        if (store is null) return Task.FromResult(Results.Text("表情库未加载。", "text/plain; charset=utf-8"));
-
-        var query = context.Request.Query["q"].ToString().Trim();
-        var items = store.GetItems()
-            .Where(item => query.Length == 0 ||
-                           item.Caption.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                           item.Tags.Any(tag => tag.Contains(query, StringComparison.OrdinalIgnoreCase)) ||
-                           item.Emotions.Any(emotion => emotion.Contains(query, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(item => item.CreatedAt)
-            .ToList();
-        var stats = store.GetStats();
-        var token = _config.Meme.LibraryToken;
-        var tokenQuery = string.IsNullOrWhiteSpace(token) ? "" : "?token=" + Uri.EscapeDataString(token);
-        var imageTokenQuery = string.IsNullOrWhiteSpace(token) ? "" : "&token=" + Uri.EscapeDataString(token);
-
-        var html = new StringBuilder();
-        html.Append("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">")
-            .Append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">")
-            .Append("<title>表情库 - MemePlugin</title><style>")
-            .Append(":root{color-scheme:light dark;--bg:#f6f4ef;--card:#fff;--text:#1b1b1f;--muted:#68666f;--line:#dedad2;--accent:#5b5bd6}")
-            .Append("@media(prefers-color-scheme:dark){:root{--bg:#17171a;--card:#222226;--text:#f0eef4;--muted:#a9a6b2;--line:#39383f;--accent:#9b9bff}}")
-            .Append("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}")
-            .Append("header{position:sticky;top:0;z-index:2;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:14px 18px}")
-            .Append("h1{margin:0;font-size:20px} .sub{color:var(--muted);font-size:12px;margin-top:3px}")
-            .Append("form{display:flex;gap:8px;margin-top:10px} input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);padding:8px 10px}")
-            .Append("button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:8px 14px;cursor:pointer}")
-            .Append("main{padding:18px;max-width:1400px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}")
-            .Append(".card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}")
-            .Append(".thumb{display:block;width:100%;height:180px;object-fit:contain;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 50%/20px 20px}")
-            .Append(".meta{padding:9px 10px;display:flex;flex-direction:column;gap:3px}.cap{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}")
-            .Append(".tag{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.id{font:11px ui-monospace,monospace;color:var(--muted)}")
-            .Append(".empty{color:var(--muted);padding:60px 0;text-align:center}</style></head><body>")
-            .Append("<header><h1>表情库</h1><div class=\"sub\">共 ").Append(stats.Count).Append(" 张 · ")
-            .Append(stats.Bytes / 1024.0 / 1024.0).Append(" MB")
-            .Append(query.Length == 0 ? "" : " · 当前筛选 " + WebUtility.HtmlEncode(query) + "：" + items.Count + " 张")
-            .Append("</div><form method=\"get\"><input name=\"q\" value=\"").Append(WebUtility.HtmlEncode(query))
-            .Append("\" placeholder=\"按描述/标签/情绪筛选\"><button type=\"submit\">筛选</button></form></header><main>");
-        if (items.Count == 0)
-        {
-            html.Append("<div class=\"empty\">没有匹配的表情。</div>");
-        }
-        else
-        {
-            html.Append("<div class=\"grid\">");
-            foreach (var item in items)
-            {
-                var imageUrl = "/plugin/MemePlugin/library/image?id=" + Uri.EscapeDataString(item.Id) + imageTokenQuery;
-                html.Append("<article class=\"card\"><img class=\"thumb\" loading=\"lazy\" src=\"")
-                    .Append(WebUtility.HtmlEncode(imageUrl)).Append("\" alt=\"")
-                    .Append(WebUtility.HtmlEncode(item.Caption)).Append("\">")
-                    .Append("<div class=\"meta\"><div class=\"cap\" title=\"")
-                    .Append(WebUtility.HtmlEncode(item.Caption)).Append("\">")
-                    .Append(WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption)).Append("</div>")
-                    .Append("<div class=\"tag\">").Append(WebUtility.HtmlEncode(string.Join(" · ", item.Tags.Take(4)))).Append("</div>")
-                    .Append("<div class=\"id\">").Append(WebUtility.HtmlEncode(item.Id[..Math.Min(8, item.Id.Length)]))
-                    .Append(" · 使用 ").Append(item.UseCount).Append(" 次</div></div></article>");
-            }
-            html.Append("</div>");
-        }
-        html.Append("</main></body></html>");
-        return Task.FromResult(Results.Content(html.ToString(), "text/html; charset=utf-8"));
-    }
-
-    private Task<IResult> ServeLibraryItemsAsync(HttpContext context)
-    {
-        if (!LibraryTokenMatches(context)) return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
-        var store = _store;
-        if (store is null)
-            return Task.FromResult(Results.Json(new { error = "library_not_ready", message = "表情库未加载。" }, statusCode: StatusCodes.Status503ServiceUnavailable));
-
-        var query = context.Request.Query["q"].ToString().Trim();
-        var tag = context.Request.Query["tag"].ToString().Trim();
-        var emotion = context.Request.Query["emotion"].ToString().Trim();
-        var page = ParsePositiveInt(context, "page", 1);
-        var pageSize = Math.Clamp(ParsePositiveInt(context, "page_size", 24), 1, 100);
-
-        var matching = store.GetItems()
-            .Where(item => query.Length == 0 ||
-                           item.Caption.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                           item.Tags.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)) ||
-                           item.Emotions.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)))
-            .Where(item => tag.Length == 0 ||
-                           item.Tags.Any(value => string.Equals(value, tag, StringComparison.OrdinalIgnoreCase)))
-            .Where(item => emotion.Length == 0 ||
-                           item.Emotions.Any(value => string.Equals(value, emotion, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(item => item.CreatedAt)
-            .ToList();
-
-        var total = matching.Count;
-        var pageItems = matching
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .Select(item =>
-            {
-                var imageQuery = string.IsNullOrWhiteSpace(_config.Meme.LibraryToken)
-                    ? ""
-                    : "&token=" + Uri.EscapeDataString(_config.Meme.LibraryToken);
-                var description = item.Emotions.Count > 0
-                    ? string.Join(" · ", item.Emotions)
-                    : string.Join(" · ", item.Tags.Take(4));
-                return new
-                {
-                    id = item.Id,
-                    title = string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption,
-                    description,
-                    image = "/plugin/MemePlugin/library/image?id=" + Uri.EscapeDataString(item.Id) + imageQuery,
-                    tags = item.Tags,
-                    values = new
-                    {
-                        kind = item.Kind,
-                        bytes = item.Bytes,
-                        created_at = item.CreatedAt,
-                        use_count = item.UseCount,
-                        emotions = item.Emotions
-                    },
-                    actions = new[] { "delete" }
-                };
-            })
-            .ToArray();
-
-        return Task.FromResult(Results.Json(new
-        {
-            items = pageItems,
-            total,
-            page,
-            page_size = pageSize,
-            has_more = (long)page * pageSize < total
-        }));
-    }
-
-    private async Task<IResult> ServeLibraryDeleteAsync(HttpContext context)
-    {
-        if (!LibraryTokenMatches(context)) return Results.StatusCode(StatusCodes.Status403Forbidden);
-        var store = _store;
-        if (store is null)
-            return Results.Json(new { ok = false, message = "表情库未加载。" }, statusCode: StatusCodes.Status503ServiceUnavailable);
-
-        var id = context.Request.Query["id"].ToString();
-        if (string.IsNullOrWhiteSpace(id))
-            return Results.Json(new { ok = false, message = "缺少 id。" }, statusCode: StatusCodes.Status400BadRequest);
-
-        var removed = await store.RemoveAsync(id).ConfigureAwait(false);
-        return Results.Json(new { ok = removed, message = removed ? "已删除。" : "未找到该表情。" },
-            statusCode: removed ? StatusCodes.Status200OK : StatusCodes.Status404NotFound);
-    }
-
-    private static int ParsePositiveInt(HttpContext context, string key, int fallback)
-    {
-        return int.TryParse(context.Request.Query[key].ToString(), out var value) && value > 0
-            ? value
-            : fallback;
-    }
-
-    private Task<IResult> ServeLibraryImage(HttpContext context)
-    {
-        if (!LibraryTokenMatches(context))
-            return Task.FromResult(Results.StatusCode(StatusCodes.Status403Forbidden));
-        var id = context.Request.Query["id"].ToString();
-        var selection = _store?.GetById(id);
-        if (selection is null || !File.Exists(selection.FilePath))
-            return Task.FromResult(Results.NotFound());
-        return Task.FromResult(Results.File(selection.FilePath, selection.Mime, enableRangeProcessing: true));
-    }
-
-    private bool LibraryTokenMatches(HttpContext context)
-    {
-        var configured = _config.Meme.LibraryToken;
-        if (string.IsNullOrWhiteSpace(configured)) return true;
-        var supplied = context.Request.Query["token"].ToString();
-        return string.Equals(configured, supplied, StringComparison.Ordinal);
     }
 
     protected override async Task OnUnloadAsync()
@@ -537,7 +293,7 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
 
         if (_tagger is null || !_tagger.IsConfigured)
         {
-            await ReplyTextAsync(message, "AI 标注未配置：请在“表情库设置”里填写 AI 接口地址、模型和 Key。").ConfigureAwait(false);
+            await ReplyTextAsync(message, "AI 标注不可用：请开启 AI 标注，并安装 AI 聊天插件借用它的模型，或在“表情库设置”里填写自己的 AI 接口地址和模型。").ConfigureAwait(false);
             return;
         }
 
@@ -839,6 +595,92 @@ public sealed class MemePlugin : PluginBase<MemeConfig>, IMemeService, IPluginDa
             !message.IsDirect,
             _config.Meme.SendWithMention,
             _config.Meme.SendWithQuote);
+
+    /// <summary>
+    /// 通过 AI 聊天插件的契约提供表情工具：工具只选图，回复后动作在 AI 聊天发出文字后发送。
+    /// 运行时双方只交换 JSON，AI 聊天插件不在时这些服务没人调用，本插件随时可以卸载和更新。
+    /// </summary>
+    private void RegisterChatServices()
+    {
+        ChatTools.AfterReply.Provide(Context, ChatToolName, HandleAfterReplyAsync, new ChatAfterReplyInfo("发送选中的表情"));
+        UpdateChatTool();
+    }
+
+    private const string ChatToolName = "send_meme";
+
+    /// <summary>借用 AI 聊天插件的识图模型做标注；AI 聊天插件不在时返回 null。</summary>
+    private async Task<string?> TagWithAiChatModelAsync(string prompt, byte[] image, string mime, string? model, CancellationToken cancellationToken)
+    {
+        var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
+            [new ChatModelMessage("user", prompt, [new ChatModelImage(mime, Convert.ToBase64String(image))])],
+            model, NeedsVision: true, MaxOutputTokens: 400, Temperature: 0), cancellationToken).ConfigureAwait(false);
+        return reply?.Text;
+    }
+
+    /// <summary>按配置注册或注销聊天工具；说明随使用倾向变化，所以每次重新注册。</summary>
+    private void UpdateChatTool()
+    {
+        _chatTool?.Dispose();
+        _chatTool = null;
+        if (!_config.Meme.Enabled || !_config.Meme.AiToolEnabled) return;
+        _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor(_config.Meme.AiToolPolicy));
+    }
+
+    internal static ChatToolInfo ChatToolInfoFor(string policy)
+    {
+        var auto = string.Equals(policy, "auto", StringComparison.OrdinalIgnoreCase);
+        return new ChatToolInfo(
+            auto
+                ? "Select one suitable meme from the local meme library for the current chat. Use proactively in casual conversation, banter, teasing, or emotional replies; do not use for serious answers. The meme is sent after your reply."
+                : "Select one suitable meme from the local meme library, only when the user explicitly asks for a meme or sticker. The meme is sent after your reply.",
+            PluginJsonSchema.For<SendMemeToolArgs>(),
+            auto
+                ? "你有一个本地表情库。回复别人时，如果语气轻松、在接梗、吐槽、卖萌、打招呼或表达情绪，应主动调用 send_meme 配一张表情，" +
+                  "不需要等用户明确要求。严肃回答、求助、工作/学习问题不要发；每次回复最多一张，不要连续发。" +
+                  "调用后最终回复只写一句很短的点评或接梗，不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。"
+                : "你有一个本地表情库。只有在用户明确要求发表情、斗图或使用表情时才调用 send_meme；" +
+                  "用户没有明确要求时不要主动发。每次回复最多一张，不要连续发。调用后最终回复只写一句很短的点评或接梗，" +
+                  "不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。",
+            MaxCallsPerTurn: 1);
+    }
+
+    /// <summary>send_meme 工具：选一张表情，要求 AI 聊天在回复后调用同名的回复后动作发送。</summary>
+    private async Task<ChatToolResult> HandleChatToolAsync(ChatToolCall call, CancellationToken cancellationToken)
+    {
+        var args = call.Arguments.As<SendMemeToolArgs>();
+        var query = args?.Query?.Trim() ?? "";
+        var emotion = args?.Emotion?.Trim();
+        if (query.Length == 0 && string.IsNullOrWhiteSpace(emotion))
+            return new ChatToolResult("query or emotion is required.");
+
+        var selection = await SelectAsync(new MemeQuery(query, emotion, call.Context.ChannelId, call.Context.SenderId), cancellationToken)
+            .ConfigureAwait(false);
+        if (selection is null)
+            return new ChatToolResult("No suitable meme is available right now, or this conversation is in cooldown. Reply with text instead.");
+
+        var content = $"Selected a meme ({selection.Caption}; tags: {string.Join(", ", selection.Tags)}). " +
+                      "It is sent after your reply. Keep the reply to one short sentence; do not describe the image.";
+        return new ChatToolResult(content,
+            new ChatAfterReply(ChatToolName, PluginJson.ToNode(new SendMemeArgs(selection.Id, args?.Caption))!.AsObject()));
+    }
+
+    /// <summary>
+    /// 回复后发送选中的表情。AI 聊天已经发了文字时只发图；没发文字时带上配文，并按 Reply.Mention / Reply.Quote @、引用。
+    /// </summary>
+    private async Task<ChatAfterReplyResult> HandleAfterReplyAsync(ChatAfterReplyCall call, CancellationToken cancellationToken)
+    {
+        var args = call.Arguments.As<SendMemeArgs>();
+        var selection = args is null ? null : _store?.GetById(args.Id);
+        if (selection is null) return new ChatAfterReplyResult(false, "未找到该表情");
+
+        var caption = call.Reply.TextSent ? "" : args!.Caption?.Trim() ?? "";
+        var context = call.Context;
+        var target = new MemeSendTarget(context.Platform, context.InstanceId, context.ChannelType, context.ChannelId,
+            context.MessageId, context.SenderId, context.IsGroup, call.Reply.Mention, call.Reply.Quote);
+        var result = await SendAsync(selection, target, caption, cancellationToken).ConfigureAwait(false);
+        return new ChatAfterReplyResult(result.Success, result.Error,
+            result.Success ? caption.Length > 0 ? caption : $"[表情：{selection.Caption}]" : null);
+    }
 
     public async Task<MemeSelection?> SelectAsync(MemeQuery query, CancellationToken cancellationToken = default)
     {

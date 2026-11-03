@@ -1,8 +1,8 @@
-namespace ShiroBot.Meme.Contracts;
+namespace ShiroBot.MemePlugin.Meme;
 
 /// <summary>
-/// 表情包库服务。由 MemePlugin 注册到宿主插件服务表，供其他插件（例如 AI 聊天）调用。
-/// 契约程序集必须作为共享程序集随插件发布，确保所有插件看到同一个接口类型。
+/// 表情库内部的选择与发送接口。其他插件使用 Contracts.MemeLibrary，
+/// 按服务名交换 JSON，不共享这里的接口、文件路径或服务对象。
 /// </summary>
 public interface IMemeService
 {
@@ -59,3 +59,15 @@ public sealed record MarketFaceInfo(
     string? Key = null,
     string? Summary = null,
     string? Url = null);
+
+/// <summary>send_meme 工具的参数，[Description] 会成为模型看到的参数说明。</summary>
+[global::ShiroBot.SDK.Plugin.PluginJson]
+public sealed record SendMemeToolArgs(
+    [property: global::System.ComponentModel.Description("Short Chinese keyword(s) describing the desired meme, e.g. 猫, 无语, 大笑, 摸鱼.")] string? Query = null,
+    [property: global::System.ComponentModel.Description("Optional emotion category: happy, sad, angry, confused, shy or daily.")] string? Emotion = null,
+    [property: global::System.ComponentModel.Description("Optional short caption, used only when you write no reply text.")] string? Caption = null);
+
+/// <summary>选中的表情，交给回复后动作发送。</summary>
+[global::ShiroBot.SDK.Plugin.PluginJson]
+public sealed record SendMemeArgs(string Id, string? Caption = null);
+

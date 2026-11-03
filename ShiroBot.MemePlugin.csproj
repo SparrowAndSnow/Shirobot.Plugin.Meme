@@ -2,6 +2,7 @@
 
     <PropertyGroup>
         <Version>1.0.1</Version>
+        <ShiroBotSdkVersion Condition="'$(ShiroBotSdkVersion)' == ''">1.0.3</ShiroBotSdkVersion>
         <TargetFramework>net10.0</TargetFramework>
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
@@ -10,34 +11,15 @@
         <ShiroBotPluginPackagingEnabled Condition="'$(Configuration)' == 'Release'">true</ShiroBotPluginPackagingEnabled>
         <ShiroBotPluginPackagingEnabled Condition="'$(Configuration)' != 'Release'">false</ShiroBotPluginPackagingEnabled>
         <DebugType>portable</DebugType>
-        <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram;ShiroBot.Meme.Contracts</ShiroBotPluginSharedAssemblies>
+        <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram</ShiroBotPluginSharedAssemblies>
         <ShiroBotDevelopmentHostEnabled>false</ShiroBotDevelopmentHostEnabled>
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Remove="Tests/**/*.cs;dev/**/*.cs;scripts/**/*.cs;ShiroBot.Meme.Contracts/**/*.cs" />
+        <Compile Remove="Tests/**/*.cs;dev/**/*.cs;scripts/**/*.cs" />
         <InternalsVisibleTo Include="ShiroBot.MemePlugin.Verification" />
-        <PackageReference Include="ShiroBot.SDK" Version="1.0.2" />
+        <PackageReference Include="ShiroBot.SDK" Version="$(ShiroBotSdkVersion)" />
         <PackageReference Include="StbImageSharp" Version="2.30.16" />
-        <ProjectReference Include="ShiroBot.Meme.Contracts/ShiroBot.Meme.Contracts.csproj" />
     </ItemGroup>
-
-
-
-  <!-- SDK 会把声明为 SharedAssemblies 的程序集当作宿主提供并从发布目录删除；
-       但 Meme 契约是插件自带的共享契约，必须在发布目录保留。 -->
-  <Target Name="CopyMemeContractsToOutput" AfterTargets="RemoveShiroBotPluginDependencyFile" Condition="'$(ShiroBotPluginPackagingEnabled)' == 'true'">
-    <ItemGroup>
-      <_MemeContractReference Include="@(ReferencePath)" Condition="'%(Filename)' == 'ShiroBot.Meme.Contracts'" />
-    </ItemGroup>
-    <Copy SourceFiles="@(_MemeContractReference)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-  </Target>
-
-  <Target Name="CopyMemeContractsToPublish" AfterTargets="RemovePublishedShiroBotPluginDependencyFile" Condition="'$(ShiroBotPluginPackagingEnabled)' == 'true'">
-    <ItemGroup>
-      <_MemeContractReference Include="@(ReferencePath)" Condition="'%(Filename)' == 'ShiroBot.Meme.Contracts'" />
-    </ItemGroup>
-    <Copy SourceFiles="@(_MemeContractReference)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
-  </Target>
 
 </Project>

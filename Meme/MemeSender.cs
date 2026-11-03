@@ -1,4 +1,3 @@
-using ShiroBot.Meme.Contracts;
 using ShiroBot.MemePlugin.Config;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Core;

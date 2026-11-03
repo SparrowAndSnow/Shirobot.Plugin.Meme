@@ -69,19 +69,25 @@ public sealed class MemeSection
     [ConfigField("表情文件存放目录，相对插件目录。", Label = "存储目录", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
     public string LibraryDir { get; set; } = "memes";
 
-    [ConfigField("可选：管理页/图片接口访问令牌；留空表示不校验。设置后需在管理页 URL 带 token。", Label = "管理页访问令牌", Type = "password", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
-    public string LibraryToken { get; set; } = "";
+    [ConfigField("向 AI 聊天等插件提供 send_meme 工具（需要宿主 1.0.3）；关闭后它们不会再发表情。", Label = "提供 AI 表情工具", Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45, GroupDescription = "给 AI 聊天插件使用的表情工具。")]
+    public bool AiToolEnabled { get; set; } = true;
+
+    [ConfigField("explicit：只在用户明确要求发表情时使用；auto：轻松聊天时主动配表情。", Label = "使用倾向", Options = new[] { "explicit", "auto" }, Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45)]
+    public string AiToolPolicy { get; set; } = "explicit";
 
     [ConfigField("启用 AI 视觉标注：让多模态模型识别表情内容，生成描述、标签和情绪；失败时回退本地规则。", Label = "AI 标注", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50, GroupDescription = "视觉模型接口、标签和表情过滤。")]
     public bool AiTaggingEnabled { get; set; }
 
-    [ConfigField("OpenAI 兼容视觉接口，例如 http://10.157.0.10:8888/v1；留空则跳过 AI 标注。", Label = "AI 接口地址", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    [ConfigField("模型来源：auto 填了接口地址就用自己的接口，否则借用 AI 聊天插件的模型；aichat 只借用 AI 聊天插件的模型；custom 只用自己的接口。", Label = "模型来源", Options = new[] { "auto", "aichat", "custom" }, Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    public string AiProvider { get; set; } = "auto";
+
+    [ConfigField("自己的 OpenAI 兼容视觉接口，例如 http://10.157.0.10:8888/v1；借用 AI 聊天插件的模型时留空。", Label = "AI 接口地址", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiBaseUrl { get; set; } = "";
 
     [ConfigField("AI API Key；本地免鉴权服务可留空。", Label = "AI API Key", Type = "password", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiApiKey { get; set; } = "";
 
-    [ConfigField("支持图片输入的模型名，例如 DeepSeek-v4.1-Flash-EXL3。", Label = "AI 模型", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    [ConfigField("支持图片输入的模型名。用自己的接口时必填；借用 AI 聊天插件时可留空，由它选一个识图模型。", Label = "AI 模型", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiModel { get; set; } = "";
 
     [ConfigField("AI 标注请求超时秒数。", Label = "AI 超时（秒）", Min = 5, Max = 120, Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]

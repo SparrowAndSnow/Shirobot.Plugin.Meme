@@ -1,10 +1,13 @@
 using System.Reflection;
-using ShiroBot.Meme.Contracts;
+using System.Text.Json.Nodes;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.MemePlugin;
 using ShiroBot.MemePlugin.Config;
+using ShiroBot.MemePlugin.Contracts;
 using ShiroBot.MemePlugin.Meme;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Config;
+using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
@@ -131,6 +134,31 @@ var png = Convert.FromBase64String(
           parsed.Tags.Contains("猫") && !parsed.Tags.Contains("表情包") &&
           parsed.Emotions.Contains("happy") && parsed.IsMeme, "AI tagger parses JSON, kind and filters generic tags");
     Check(MemeAiTagger.Parse("{\"choices\":[]}", config) is null, "AI tagger rejects empty choices");
+    Check(MemeAiTagger.ParseContent("好的，结果如下：{\"caption\":\"狗\",\"tags\":[\"狗\"],\"kind\":\"meme\"} 以上", config)?.Caption == "狗",
+        "AI tagger finds the JSON after leading text");
+
+    // 模型来源：auto 有接口地址时用自己的接口，否则借用 AI 聊天插件；aichat / custom 固定。
+    Check(MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "auto", AiBaseUrl = "http://x/v1" }) &&
+          !MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "auto" }) &&
+          !MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "aichat", AiBaseUrl = "http://x/v1" }) &&
+          MemeAiTagger.UsesCustomEndpoint(new MemeSection { AiProvider = "custom" }),
+        "AI tagger picks its model source from ai_provider");
+
+    var borrowed = new MemeSection { AiTaggingEnabled = true, AiMaxTags = 8, AiInferEmotions = true, AiModel = "vision" };
+    using var tagger = new MemeAiTagger(borrowed, new NetworkSection());
+    Check(!tagger.IsConfigured, "Borrowing AIChat needs the AIChat bridge");
+    (string Prompt, byte[] Image, string Mime, string? Model)? asked = null;
+    tagger.AiChat = (prompt, image, mime, model, _) =>
+    {
+        asked = (prompt, image, mime, model);
+        return Task.FromResult<string?>("{\"caption\":\"猫\",\"tags\":[\"猫\"],\"emotions\":[\"happy\"],\"kind\":\"meme\"}");
+    };
+    var tags = await tagger.TagAsync([1, 2, 3], "image/png", "上下文");
+    Check(tagger.IsConfigured && tags is { Caption: "猫", IsMeme: true } && asked is { Mime: "image/png", Model: "vision" } &&
+          asked.Value.Image.Length == 3 && asked.Value.Prompt.Contains("上下文"),
+        "AI tagger borrows the AIChat model with the image, prompt and configured model");
+    tagger.AiChat = (_, _, _, _, _) => Task.FromResult<string?>(null);
+    Check(await tagger.TagAsync([1], "image/png", "") is null, "AI tagger skips tagging while AIChat is missing");
 }
 
 // ---- ingest queue ----
@@ -273,18 +301,33 @@ var png = Convert.FromBase64String(
     };
 
     var services = DispatchProxy.Create<IPluginServices, TestProxy>();
-    IMemeService? registered = null;
+    // 契约的服务最终通过 ProvideUtf8 注册：按服务名记下处理函数和描述。
+    var provided = new Dictionary<string, (PluginUtf8Handler Handler, ReadOnlyMemory<byte> Metadata)>();
     ((TestProxy)(object)services).Call = (method, args) =>
     {
-        if (method.Name == "RegisterSingleton" && args is { Length: > 0 })
-            registered = args[0] as IMemeService;
+        if (method.Name == "ProvideUtf8" && args is { Length: 3 })
+            provided[(string)args[0]!] = ((PluginUtf8Handler)args[1]!, (ReadOnlyMemory<byte>)args[2]!);
         return null;
     };
 
+    async Task<TResponse?> CallAsync<TRequest, TResponse>(string service, TRequest request)
+    {
+        var response = await provided[service].Handler(PluginJson.Serialize(request), CancellationToken.None);
+        return PluginJson.Deserialize<TResponse>(response.Span);
+    }
+
+    var pages = new Dictionary<string, Func<DashboardContext, CancellationToken, Task<UiNode>>>();
+    var dashboardRegistration = DispatchProxy.Create<IPluginDashboard, TestProxy>();
+    ((TestProxy)(object)dashboardRegistration).Call = (method, args) =>
+    {
+        if (method.Name == "AddPage") pages[(string)args![0]!] = (Func<DashboardContext, CancellationToken, Task<UiNode>>)args[2]!;
+        return null;
+    };
     var bot = DispatchProxy.Create<IBotContext, TestProxy>();
     ((TestProxy)(object)bot).Call = (method, args) => method.Name switch
     {
         "get_Config" => configContext,
+        "get_Dashboard" => dashboardRegistration,
         "get_PluginDirectory" => root,
         "get_Services" => services,
         "get_Message" => messageContext,
@@ -302,13 +345,59 @@ var png = Convert.FromBase64String(
 
     var plugin = new MemePlugin();
     await plugin.OnLoad(bot);
-    Check(registered is not null, "plugin registers IMemeService");
+    var toolInfo = PluginJson.Deserialize<ChatToolInfo>(provided.GetValueOrDefault("chat.tool.send_meme").Metadata.Span);
+    Check(provided.ContainsKey("chat.after_reply.send_meme") && toolInfo is { MaxCallsPerTurn: 1 } &&
+          (string?)toolInfo.Parameters?["properties"]?["query"]?["type"] == "string" && toolInfo.Prompt?.Contains("明确要求") == true,
+        "plugin provides the send_meme chat tool and after-reply action through the AIChat contract");
 
     var storeField = typeof(MemePlugin).GetField("_store", BindingFlags.Instance | BindingFlags.NonPublic)!;
     var store = (MemeStore)storeField.GetValue(plugin)!;
     var item = await store.AddAsync(png, "image/png", "猫猫", ["猫"], ["happy"],
         new MemeSource { Platform = "qq", ChannelId = "g1" }, null);
     Check(item is not null, "plugin store add");
+
+    var contractSelection = await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", ChannelId: "contract-group"));
+    Check(contractSelection?.Meme is { } chosen && chosen.Id == item!.Id && chosen.Mime == "image/png" &&
+          PluginJson.Serialize(contractSelection).AsSpan().IndexOf("file_path"u8) < 0,
+        "exported library contract selects metadata without exposing file paths");
+    var contractTarget = new MemeDestination("qq", "Group", "contract-group", "test", SenderId: "u1", Mention: true);
+    var invalidContractSend = await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+        new MemeSendRequest(item!.Id[..8], contractTarget));
+    Check(invalidContractSend is { Ok: false } && sentSegments.Count == 0,
+        "library contract rejects abbreviated IDs before sending");
+    var invalidTargetSend = await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+        new MemeSendRequest(item.Id, contractTarget with { ChannelType = "invalid" }));
+    Check(invalidTargetSend is { Ok: false } && sentSegments.Count == 0,
+        "library contract rejects invalid destinations");
+    var contractSend = await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+        new MemeSendRequest(item.Id, contractTarget, "契约测试"));
+    Check(contractSend is { Ok: true, MessageId: "sent-1" } && sentSegments.OfType<MentionSegment>().Any(),
+        "exported library contract sends the stored image by ID");
+    Check((await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", ChannelId: "contract-group"))) is { Meme: null },
+        "library contract honors per-conversation cooldown");
+    var statsJson = await provided[MemeLibrary.Stats.Name].Handler(ReadOnlyMemory<byte>.Empty, CancellationToken.None);
+    Check(PluginJson.Deserialize<MemeStats>(statsJson.Span) is { Enabled: true, Count: 1 },
+        "exported library contract provides statistics");
+    config.Meme.Enabled = false;
+    Check((await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", ChannelId: "disabled-group"))) is { Meme: null } &&
+        (await CallAsync<MemeSendRequest, MemeSendResponse>(MemeLibrary.Send.Name,
+            new MemeSendRequest(item.Id, contractTarget with { ChannelId = "disabled-group" }))) is { Ok: false, Error: "表情库未启用" },
+        "disabled library cannot be used through plugin contracts");
+    config.Meme.Enabled = true;
+    using (var canceledContract = new CancellationTokenSource())
+    {
+        canceledContract.Cancel();
+        try
+        {
+            await provided[MemeLibrary.Select.Name].Handler(PluginJson.Serialize(new MemeSelectRequest("猫")), canceledContract.Token);
+            Check(false, "library contract cancellation propagated");
+        }
+        catch (OperationCanceledException) { Check(true, "library contract cancellation propagated"); }
+    }
+    sentSegments.Clear();
 
     var fallback = await plugin.SelectAsync(new MemeQuery("不存在的关键词", ChannelId: "g1"));
     Check(fallback is not null, "plugin selection falls back to library");
@@ -322,8 +411,85 @@ var png = Convert.FromBase64String(
     Check(sentSegments.OfType<TextSegment>().Any(t => t.Text.Contains("猫猫来了")), "sender includes caption");
     Check((await plugin.SelectAsync(new MemeQuery("猫", ChannelId: "g1"))) is null, "cooldown blocks second select");
 
+    // AI 聊天工具：只选图并要求回复后发送；没有文字时带配文、按要求 @。
+    var chat = new ChatToolContext("qq", "test", "Group", "g2", "m2", "u2", true, false);
+    var sentBefore = sentSegments.Count;
+    var toolResult = await CallAsync<ChatToolCall, ChatToolResult>("chat.tool.send_meme",
+        new ChatToolCall(new JsonObject { ["query"] = "猫", ["caption"] = "喵" }, chat));
+    var after = toolResult?.AfterReply;
+    Check(after is { Name: "send_meme" } && (string?)after.Arguments?["id"] == item!.Id && sentSegments.Count == sentBefore,
+        "send_meme tool selects without sending");
+    sentSegments.Clear();
+    var sendResult = await CallAsync<ChatAfterReplyCall, ChatAfterReplyResult>("chat.after_reply.send_meme",
+        new ChatAfterReplyCall(after!.Arguments, chat, new ChatReplyState(TextSent: false, Mention: true, Quote: false)));
+    Check(sendResult is { Ok: true, History: "喵" } &&
+          sentSegments.OfType<MentionSegment>().Any() && sentSegments.OfType<TextSegment>().Any(t => t.Text.Contains("喵")),
+        "the after-reply action sends with caption and mention when no reply text was sent");
+
     var stats = await plugin.GetStatsAsync();
     Check(stats.Count == 1, "plugin stats");
+    // Dashboard uses the host contract, with no public library routes or signed image URLs.
+    Check(pages.ContainsKey("library"), "library page registered through Context.Dashboard");
+    async Task<UiLayout> Render(Dictionary<string, string>? state = null) =>
+        (UiLayout)await pages["library"](new DashboardContext("library", state ?? []), CancellationToken.None);
+    UiCollection Collection(UiLayout tree) => tree.Children.OfType<UiCollection>().Single();
+    var gallery = await Render(new() { ["q"] = "猫", ["emotion"] = "happy", ["tag"] = "猫" });
+    Check(Collection(gallery).Rows() is [{ Key: var key, Card.Image: var imageId }] && key == item!.Id && imageId == item.Id &&
+        gallery.Children.OfType<UiPager>().Single().Total == 1, "component tree filters and opaque image IDs");
+    var empty = await Render(new() { ["page"] = int.MaxValue.ToString() });
+    Check(Collection(empty).Rows().Count == 0, "dashboard page overflow does not wrap to first page");
+    var image = await plugin.OpenLibraryImageAsync(item!.Id);
+    Check(image?.Path == selection!.FilePath && image.ContentType == "image/png", "dashboard file resolver serves library image");
+    var e = new DashboardEvent(new DashboardContext("library", new Dictionary<string, string>()), "gallery");
+    Check(Collection(gallery).Invoke("unknown", item.Id, e, CancellationToken.None) is null &&
+          Collection(gallery).Invoke("delete", item.Id[..8], e, CancellationToken.None) is null,
+        "component action rejects unknown actions and abbreviated IDs");
+    var deleted = await Collection(gallery).Invoke("delete", item.Id, e, CancellationToken.None)!;
+    Check(deleted is { Ok: true, Refresh: true } && await plugin.OpenLibraryImageAsync(item.Id) is null,
+        "component delete refreshes and removes image");
+
+    var dashboard = plugin;
+    Check((await Render()).Children.OfType<UiUpload>().Single() is { MaxBytes: 5000000 } descriptor && descriptor.Accept.Contains("image/webp"),
+        "dashboard declares configured image upload limits");
+    var invalid = await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("fake.png", "image/png", "<script>bad</script>"u8.ToArray()));
+    Check(!invalid.Ok && store.GetStats().Count == 0, "dashboard rejects renamed non-image uploads");
+    config.Meme.MaxBytes = 1;
+    Check(!(await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("too-large.png", "image/png", png))).Ok &&
+          (await Render()).Children.OfType<UiUpload>().Single().MaxBytes == 1, "dashboard upload follows the current size limit");
+    config.Meme.MaxBytes = 5_000_000;
+    config.Meme.Enabled = false;
+    Check(!(await Render()).Children.OfType<UiUpload>().Any() && !(await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("disabled.png", "image/png", png))).Ok,
+        "disabled meme library does not accept uploads");
+    config.Meme.Enabled = true;
+    var tagger = (MemeAiTagger)typeof(MemePlugin).GetField("_tagger", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(plugin)!;
+    config.Meme.AiTaggingEnabled = true;
+    config.Meme.AiProvider = "aichat";
+    config.Meme.AiFilterNonMeme = true;
+    var taggingCalls = 0;
+    tagger.AiChat = (_, _, _, _, _) =>
+    {
+        taggingCalls++;
+        return Task.FromResult<string?>("""{"caption":"上传测试","tags":["上传"],"emotions":["happy"],"kind":"other"}""");
+    };
+    var uploaded = await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("test.jpg", "image/jpeg", png));
+    var uploadedItem = store.GetItems().Single();
+    Check(uploaded is { Ok: true, Refresh: true } && uploadedItem.Mime == "image/png" && uploadedItem.Caption == "上传测试" &&
+          uploadedItem.Tags.Contains("上传") && uploadedItem.Kind == "other", "manual upload sniffs content and keeps intentionally uploaded images with AI tags");
+    Check((await File.ReadAllBytesAsync(store.GetById(uploadedItem.Id)!.FilePath)).SequenceEqual(png),
+        "uploaded image bytes are preserved without re-encoding");
+    var duplicateUpload = await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("same.png", "image/png", png));
+    Check(duplicateUpload.Ok && store.GetStats().Count == 1 && taggingCalls == 1, "repeated uploads deduplicate before paid AI tagging");
+    using (var canceledUpload = new CancellationTokenSource())
+    {
+        canceledUpload.Cancel();
+        try
+        {
+            await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("canceled.png", "image/png", png), canceledUpload.Token);
+            Check(false, "upload cancellation propagated");
+        }
+        catch (OperationCanceledException) { Check(true, "upload cancellation propagated"); }
+    }
+
     await plugin.OnUnload();
     Check(File.Exists(Path.Combine(root, "config.toml")), "default config template written");
 }
