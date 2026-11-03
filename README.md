@@ -44,9 +44,8 @@ ShiroBot/plugins/MemePlugin/
   ShiroBot.Meme.Contracts.dll
 ```
 
-如果同时使用 AI 聊天插件，`plugins/AiChatPlugin/` 也需要同一个
-`ShiroBot.Meme.Contracts.dll`。**请复制同一个文件**，不要分别从不同构建取契约 DLL；
-宿主会校验共享程序集的 MVID，版本不一致会要求重启或拒绝加载。
+如果同时使用 AI 聊天插件，`plugins/AiChatPlugin/` 则动态加载
+`ShiroBot.Meme.Contracts.dll`。
 
 ## 配置
 
