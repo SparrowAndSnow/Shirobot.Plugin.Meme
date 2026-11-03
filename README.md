@@ -18,7 +18,21 @@
 
 ## 构建
 
-需要 .NET 10 SDK。本项目引用 `ShiroBot.SDK 1.0.3`，需要宿主 1.0.3 及以上。
+需要 .NET 10 SDK。本分支的 Dashboard 页面使用尚未发布的 `Context.Dashboard.AddPage` / `Ui` 契约，必须配合同批宿主和 Dashboard 源码使用；旧版 SDK 不包含这些类型。
+
+未发布 SDK 的本地测试构建（`SHIROBOT_SOURCE` 指向宿主源码仓库，`LOCAL_FEED` 使用绝对路径）：
+
+```bash
+SHIROBOT_SOURCE=/path/to/ShiroBot
+LOCAL_FEED=/tmp/shirobot-dashboard-sdk
+# 在宿主源码目录打本地测试包，不发布到 NuGet、不打 tag。
+dotnet pack "$SHIROBOT_SOURCE/Packaging/ShiroBot.SDK.Package/ShiroBot.SDK.Package.csproj" -c Release -p:ShiroBotProductVersion=1.0.3-dashboard-ui.3 -o "$LOCAL_FEED"
+# 回到此插件目录，用测试包还原并构建。
+dotnet restore -p:ShiroBotSdkVersion=1.0.3-dashboard-ui.3 --source "$LOCAL_FEED" --source https://api.nuget.org/v3/index.json
+dotnet publish ShiroBot.MemePlugin.csproj -c Release -p:ShiroBotSdkVersion=1.0.3-dashboard-ui.3 --no-restore
+```
+
+新 SDK 正式发布后，将 `ShiroBotSdkVersion` 更新到对应版本，恢复常规构建：
 
 ```bash
 dotnet publish ShiroBot.MemePlugin.csproj -c Release
@@ -140,7 +154,7 @@ SHA-256 去重。`perceptual_threshold=0` 可关闭视觉去重，只保留精�
 ```
 
 在 Dashboard 打开本插件的“配置”，左侧分为“配置 → 插件页面 → 路由与监听”三个区块，在中间的“插件页面”区选择“表情库”，可以多选上传图片、搜索、按标签和情绪筛选、分页查看和删除表情。
-此功能使用宿主 1.0.3 的 `IPluginDashboardProvider`，与配置数据分开；列表、操作和图片全部走宿主统一鉴权的 API。表情库的操作即时生效，不使用配置保存按钮。
+此功能使用宿主 1.0.3 的 `Context.Dashboard.AddPage` 与 `Ui` 组件树，与配置数据分开；列表、操作和图片全部走宿主统一鉴权的 API。表情库的操作即时生效，不使用配置保存按钮。
 上传支持 PNG、JPEG、GIF、WebP，按 `max_bytes` 限制单文件大小（默认 5,000,000 字节，宿主上限 20,000,000 字节），保留原始图片和动图。重复图片会跳过；开启 AI 标注时复用已配置模型生成描述、标签和情绪，手动上传不受自动采集的非表情过滤影响。支持逐张处理、取消和上传后刷新。
 插件不再注册 `/plugin/MemePlugin/library/...` 公开管理路由，旧 `library_token` 不再使用，也不再生成签名图片链接。
 

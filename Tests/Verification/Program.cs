@@ -316,10 +316,18 @@ var png = Convert.FromBase64String(
         return PluginJson.Deserialize<TResponse>(response.Span);
     }
 
+    var pages = new Dictionary<string, Func<DashboardContext, CancellationToken, Task<UiNode>>>();
+    var dashboardRegistration = DispatchProxy.Create<IPluginDashboard, TestProxy>();
+    ((TestProxy)(object)dashboardRegistration).Call = (method, args) =>
+    {
+        if (method.Name == "AddPage") pages[(string)args![0]!] = (Func<DashboardContext, CancellationToken, Task<UiNode>>)args[2]!;
+        return null;
+    };
     var bot = DispatchProxy.Create<IBotContext, TestProxy>();
     ((TestProxy)(object)bot).Call = (method, args) => method.Name switch
     {
         "get_Config" => configContext,
+        "get_Dashboard" => dashboardRegistration,
         "get_PluginDirectory" => root,
         "get_Services" => services,
         "get_Message" => messageContext,
@@ -421,36 +429,36 @@ var png = Convert.FromBase64String(
     var stats = await plugin.GetStatsAsync();
     Check(stats.Count == 1, "plugin stats");
     // Dashboard uses the host contract, with no public library routes or signed image URLs.
-    var dashboard = (IPluginDashboardProvider)plugin;
-    Check(dashboard.Pages is [{ Id: "library", Kind: "gallery" }], "independent library dashboard page");
-    var gallery = await dashboard.QueryAsync("library", new DashboardQuery(1, 1,
-        new Dictionary<string, string> { ["q"] = "猫", ["emotion"] = "happy", ["tag"] = "猫" }));
-    Check(gallery is { Total: 1, HasMore: false, Items.Count: 1 } && gallery.Items[0].ImageFileId == item!.Id &&
-          gallery.Items[0].Actions!.Contains("delete"), "dashboard filters and opaque file IDs");
-    var empty = await dashboard.QueryAsync("library", new DashboardQuery(int.MaxValue, 100, new Dictionary<string, string>()));
-    Check(empty.Items.Count == 0 && empty.Total == 1, "dashboard page overflow does not wrap to the first page");
-    var found = await dashboard.GetItemAsync("library", item!.Id);
-    Check(found?.Id == item.Id && await dashboard.GetItemAsync("library", "missing") is null,
-        "dashboard action lookup requires an existing exact ID");
-    var image = await dashboard.OpenFileAsync("library", item.Id);
-    Check(image?.Path == selection!.FilePath && image.ContentType == "image/png", "dashboard image is served through host file API");
-    Check(!(await dashboard.RunActionAsync("library", "unknown", item.Id)).Ok &&
-          !(await dashboard.RunActionAsync("library", "delete", item.Id[..8])).Ok,
-        "dashboard rejects unknown actions and abbreviated IDs");
-    var deleted = await dashboard.RunActionAsync("library", "delete", item.Id);
-    Check(deleted is { Ok: true, Refresh: true } && await dashboard.GetItemAsync("library", item.Id) is null &&
-          await dashboard.OpenFileAsync("library", item.Id) is null, "dashboard delete refreshes and removes image");
+    Check(pages.ContainsKey("library"), "library page registered through Context.Dashboard");
+    async Task<UiLayout> Render(Dictionary<string, string>? state = null) =>
+        (UiLayout)await pages["library"](new DashboardContext("library", state ?? []), CancellationToken.None);
+    UiCollection Collection(UiLayout tree) => tree.Children.OfType<UiCollection>().Single();
+    var gallery = await Render(new() { ["q"] = "猫", ["emotion"] = "happy", ["tag"] = "猫" });
+    Check(Collection(gallery).Rows() is [{ Key: var key, Card.Image: var imageId }] && key == item!.Id && imageId == item.Id &&
+        gallery.Children.OfType<UiPager>().Single().Total == 1, "component tree filters and opaque image IDs");
+    var empty = await Render(new() { ["page"] = int.MaxValue.ToString() });
+    Check(Collection(empty).Rows().Count == 0, "dashboard page overflow does not wrap to first page");
+    var image = await plugin.OpenLibraryImageAsync(item!.Id);
+    Check(image?.Path == selection!.FilePath && image.ContentType == "image/png", "dashboard file resolver serves library image");
+    var e = new DashboardEvent(new DashboardContext("library", new Dictionary<string, string>()), "gallery");
+    Check(Collection(gallery).Invoke("unknown", item.Id, e, CancellationToken.None) is null &&
+          Collection(gallery).Invoke("delete", item.Id[..8], e, CancellationToken.None) is null,
+        "component action rejects unknown actions and abbreviated IDs");
+    var deleted = await Collection(gallery).Invoke("delete", item.Id, e, CancellationToken.None)!;
+    Check(deleted is { Ok: true, Refresh: true } && await plugin.OpenLibraryImageAsync(item.Id) is null,
+        "component delete refreshes and removes image");
 
-    Check(dashboard.Pages[0].Upload is { MaxBytes: 5000000 } descriptor && descriptor.ContentTypes!.Contains("image/webp"),
+    var dashboard = plugin;
+    Check((await Render()).Children.OfType<UiUpload>().Single() is { MaxBytes: 5000000 } descriptor && descriptor.Accept.Contains("image/webp"),
         "dashboard declares configured image upload limits");
-    var invalid = await dashboard.UploadAsync("library", new DashboardUploadFile("fake.png", "image/png", "<script>bad</script>"u8.ToArray()));
+    var invalid = await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("fake.png", "image/png", "<script>bad</script>"u8.ToArray()));
     Check(!invalid.Ok && store.GetStats().Count == 0, "dashboard rejects renamed non-image uploads");
     config.Meme.MaxBytes = 1;
-    Check(!(await dashboard.UploadAsync("library", new DashboardUploadFile("too-large.png", "image/png", png))).Ok &&
-          dashboard.Pages[0].Upload?.MaxBytes == 1, "dashboard upload follows the current size limit");
+    Check(!(await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("too-large.png", "image/png", png))).Ok &&
+          (await Render()).Children.OfType<UiUpload>().Single().MaxBytes == 1, "dashboard upload follows the current size limit");
     config.Meme.MaxBytes = 5_000_000;
     config.Meme.Enabled = false;
-    Check(dashboard.Pages[0].Upload is null && !(await dashboard.UploadAsync("library", new DashboardUploadFile("disabled.png", "image/png", png))).Ok,
+    Check(!(await Render()).Children.OfType<UiUpload>().Any() && !(await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("disabled.png", "image/png", png))).Ok,
         "disabled meme library does not accept uploads");
     config.Meme.Enabled = true;
     var tagger = (MemeAiTagger)typeof(MemePlugin).GetField("_tagger", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(plugin)!;
@@ -463,20 +471,20 @@ var png = Convert.FromBase64String(
         taggingCalls++;
         return Task.FromResult<string?>("""{"caption":"上传测试","tags":["上传"],"emotions":["happy"],"kind":"other"}""");
     };
-    var uploaded = await dashboard.UploadAsync("library", new DashboardUploadFile("test.jpg", "image/jpeg", png));
+    var uploaded = await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("test.jpg", "image/jpeg", png));
     var uploadedItem = store.GetItems().Single();
     Check(uploaded is { Ok: true, Refresh: true } && uploadedItem.Mime == "image/png" && uploadedItem.Caption == "上传测试" &&
           uploadedItem.Tags.Contains("上传") && uploadedItem.Kind == "other", "manual upload sniffs content and keeps intentionally uploaded images with AI tags");
     Check((await File.ReadAllBytesAsync(store.GetById(uploadedItem.Id)!.FilePath)).SequenceEqual(png),
         "uploaded image bytes are preserved without re-encoding");
-    var duplicateUpload = await dashboard.UploadAsync("library", new DashboardUploadFile("same.png", "image/png", png));
+    var duplicateUpload = await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("same.png", "image/png", png));
     Check(duplicateUpload.Ok && store.GetStats().Count == 1 && taggingCalls == 1, "repeated uploads deduplicate before paid AI tagging");
     using (var canceledUpload = new CancellationTokenSource())
     {
         canceledUpload.Cancel();
         try
         {
-            await dashboard.UploadAsync("library", new DashboardUploadFile("canceled.png", "image/png", png), canceledUpload.Token);
+            await dashboard.ImportLibraryImageAsync( new DashboardUploadFile("canceled.png", "image/png", png), canceledUpload.Token);
             Check(false, "upload cancellation propagated");
         }
         catch (OperationCanceledException) { Check(true, "upload cancellation propagated"); }
