@@ -17,7 +17,8 @@ namespace ShiroBot.MemePlugin;
     Name = "表情包插件",
     Version = "1.0.1",
     Description = "本地表情库、群聊盗图采集、QQ 商城表情降级发送，并向其他插件提供表情服务。",
-    Author = "ShirokaProject",
+    Author = "SparrowAndSnow",
+    GithubRepo = "SparrowAndSnow/Shirobot.Plugin.Meme",
     Category = PluginCategory.Media,
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
