@@ -75,8 +75,8 @@ public sealed class MemeSection
     [ConfigField("explicit：只在用户明确要求发表情时使用；auto：轻松聊天时主动配表情。", Label = "使用倾向", Options = new[] { "explicit", "auto" }, Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45)]
     public string AiToolPolicy { get; set; } = "explicit";
 
-    [ConfigField("启用 AI 视觉标注：让多模态模型识别表情内容，生成描述、标签和情绪；失败时回退本地规则。", Label = "AI 标注", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50, GroupDescription = "视觉模型接口、标签和表情过滤。")]
-    public bool AiTaggingEnabled { get; set; }
+    [ConfigField("启用 AI 视觉标注：让多模态模型识别表情内容，生成描述、标签和情绪；默认开启，自动采集和上传入库时立即标注；模型不可用时保留基础标签。", Label = "AI 标注", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50, GroupDescription = "视觉模型接口、标签和表情过滤。")]
+    public bool AiTaggingEnabled { get; set; } = true;
 
     [ConfigField("模型来源：auto 填了接口地址就用自己的接口，否则借用 AI 聊天插件的模型；aichat 只借用 AI 聊天插件的模型；custom 只用自己的接口。", Label = "模型来源", Options = new[] { "auto", "aichat", "custom" }, Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiProvider { get; set; } = "auto";
@@ -102,7 +102,7 @@ public sealed class MemeSection
     [ConfigField("AI 附加提示词；留空使用默认。", Label = "AI 附加提示", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiPrompt { get; set; } = "";
 
-    [ConfigField("只收录 AI 判定为表情包的内容；截图、照片和其他图片会跳过（仅自动采集，手动 add/save 不受影响）。", Label = "只收录表情包", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    [ConfigField("只收录 AI 判定为表情包的内容；自动采集跳过截图、照片和其他图片；重新标注时将这些图片移至 rejected 目录，手动 add/save 不受影响。", Label = "只收录表情包", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public bool AiFilterNonMeme { get; set; } = true;
 }
 

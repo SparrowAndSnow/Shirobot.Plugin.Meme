@@ -53,9 +53,9 @@ internal sealed class MemeIngestQueue : IAsyncDisposable
                     continue;
                 }
 
-                var tags = MemeTagging.ExtractTags(job.MessageText, job.Summary, job.MarketFace);
-                var emotions = MemeTagging.GuessEmotions($"{job.MessageText} {job.Summary}");
-                var caption = MemeTagging.BuildCaption(job.Summary, job.MessageText, config.CaptionMaxChars);
+                var tags = MemeTagging.ExtractTags("", job.Summary, job.MarketFace);
+                var emotions = MemeTagging.GuessEmotions(job.Summary ?? "");
+                var caption = MemeTagging.BuildCaption(job.Summary, "", config.CaptionMaxChars);
                 var kind = "unknown";
 
                 if (_tagger is { } tagger && tagger.IsConfigured)

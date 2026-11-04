@@ -95,22 +95,40 @@ internal static class SaveToolVerification
             Check(saved.Contains("已保存") && saved.Contains("猫、乖巧") && store.GetItems().Single().Tags.Contains("乖巧"),
                 "save tool persists supplied labels despite automatic collection being off and outside whitelist");
             Check((await Call()).Contains("已在库中") && store.GetStats().Count == 1, "save tool confirms duplicates without adding another image");
+            var updatedArgs = new JsonObject { ["caption"] = "抱着牛奶的小黄鸡", ["tags"] = new JsonArray("小黄鸡", "牛奶") };
+            var relabeled = await Call(args: updatedArgs);
+            Check(relabeled.Contains("已更新描述和标签") && store.GetItems().Single().Caption == "抱着牛奶的小黄鸡" &&
+                store.GetItems().Single().Tags.SequenceEqual(new[] { "小黄鸡", "牛奶" }),
+                "explicit save replaces auto-collected placeholder tags on duplicate images");
             await store.RemoveAsync(store.GetItems().Single().Id);
             messages["request"] = message with { Segments = [new QuoteSegment("quoted")] };
             messages["quoted"] = message with { MessageId = "quoted", Sender = new User("bot") };
             var tagger = (MemeAiTagger)typeof(MemePlugin).GetField("_tagger", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(plugin)!;
             config.Meme.AiTaggingEnabled = true;
             config.Meme.AiProvider = "aichat";
-            tagger.AiChat = (_, _, _, _, _) => Task.FromResult<string?>("""{"caption":"视觉描述","tags":["识图标签"],"emotions":["happy"],"kind":"other"}""");
+            tagger.AiChat = (_, _, _, _, _) => throw new Exception("Saving visual labels must not call back into the busy AIChat model");
             saved = await Call();
-            Check(saved.Contains("已保存") && saved.Contains("识图标签") && saved.Contains("乖巧") &&
+            Check(saved.Contains("已保存") && saved.Contains("猫") && saved.Contains("乖巧") &&
                 store.GetItems().Single().Source.MessageId == "quoted" && reads.All(r => r.InstanceId == "test" && r.Channel.Id == "g1"),
-                "save tool resolves quoted bot image in same conversation and merges vision labels without non-meme filtering");
+                "save tool persists supplied visual labels for quoted bot image without a recursive AIChat request");
             await store.RemoveAsync(store.GetItems().Single().Id);
             messages["quoted"] = message with { MessageId = "quoted", InstanceId = "wrong-instance" };
             Check((await Call()).Contains("未保存") && store.GetStats().Count == 0, "save tool rejects foreign-instance quotes");
             messages["request"] = message with { Segments = [new TextSegment("保存一下")] };
             Check((await Call()).Contains("未保存") && store.GetStats().Count == 0, "save tool does not claim success without an image");
+            config.Meme.AiTaggingEnabled = false;
+            var snapshotContext = chat with { Images = new[] { new ChatToolImage(2, "image/png", Convert.ToBase64String(png)) } };
+            var snapshotArgs = Args();
+            snapshotArgs["image_ids"] = new JsonArray(2);
+            saved = await Call(snapshotContext, snapshotArgs);
+            Check(saved.Contains("已保存") && store.GetStats().Count == 1,
+                "separate historical image saves from AIChat snapshot without a current attachment or CDN fetch");
+            await store.RemoveAsync(store.GetItems().Single().Id);
+            snapshotArgs["image_ids"] = new JsonArray(3);
+            Check((await Call(snapshotContext, snapshotArgs)).Contains("未保存") && store.GetStats().Count == 0,
+                "snapshot image IDs must match the model selection");
+            Check((await Call(chat, snapshotArgs)).Contains("未保存") && store.GetStats().Count == 0,
+                "old AIChat cannot silently substitute another attachment for selected history images");
             messages["request"] = message with { Segments = [new ImageSegment("base64://" + Convert.ToBase64String("not an image"u8.ToArray()))] };
             Check((await Call()).Contains("保存失败") && store.GetStats().Count == 0, "save tool rejects invalid image bytes");
             messages["request"] = message;

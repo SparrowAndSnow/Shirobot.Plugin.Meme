@@ -63,6 +63,11 @@ var png = Convert.FromBase64String(
 
     Check(await store.RemoveAsync(item.Id), "store remove");
     Check(store.GetStats().Count == 0, "store remove updates stats");
+    var rejectedItem = await store.AddAsync(png, "image/png", "截图", ["截图"], ["daily"], new MemeSource(), null);
+    Check(await store.QuarantineAsync(rejectedItem!.Id) && store.GetStats().Count == 0 &&
+        File.Exists(Path.Combine(root, "rejected", rejectedItem.FileName)),
+        "AI cleanup removes rejected images from the library while preserving recoverable originals");
+
     store.Dispose();
 
     await File.WriteAllTextAsync(Path.Combine(root, "index.json"), "{not-json");
@@ -73,6 +78,18 @@ var png = Convert.FromBase64String(
     corrupt.Dispose();
 }
 
+
+// ---- search exclusions and relevance ----
+{
+    using var store = new MemeStore(TempRoot("meme-search-"), new MemeSection { PerceptualThreshold = 0 });
+    var exact = await store.AddAsync([1], "image/png", "精确匹配", ["猫"], ["happy"], new MemeSource(), null);
+    var popular = await store.AddAsync([2], "image/png", "猫", ["猫猫"], ["happy"], new MemeSource(), null);
+    for (var i = 0; i < 500; i++) await store.MarkUsedAsync(popular!.Id);
+    Check(store.Search("猫", null, 1).Single().Id == exact!.Id,
+        "usage count cannot promote a weaker match over an exact tag");
+    Check(store.Search("猫", null, 1, new HashSet<string> { exact.Id }).Single().Id == popular!.Id,
+        "recent IDs are excluded before the search limit");
+}
 
 // ---- perceptual dedupe ----
 {
@@ -134,6 +151,7 @@ var png = Convert.FromBase64String(
           parsed.Tags.Contains("猫") && !parsed.Tags.Contains("表情包") &&
           parsed.Emotions.Contains("happy") && parsed.IsMeme, "AI tagger parses JSON, kind and filters generic tags");
     Check(MemeAiTagger.Parse("{\"choices\":[]}", config) is null, "AI tagger rejects empty choices");
+    Check(MemeAiTagger.ParseContent("{\"caption\":\"一只黄色蛋形小鸡玩偶", config) is null, "truncated visual labeling JSON cannot be counted as a successful update");
     Check(MemeAiTagger.ParseContent("好的，结果如下：{\"caption\":\"狗\",\"tags\":[\"狗\"],\"kind\":\"meme\"} 以上", config)?.Caption == "狗",
         "AI tagger finds the JSON after leading text");
 
@@ -203,6 +221,46 @@ var png = Convert.FromBase64String(
     Check(store.GetStats().Count == 2, "sticker mode keeps GIF and skips JPEG");
     await queue.DisposeAsync();
     store.Dispose();
+}
+
+// Incoming images receive visual labels before the first persisted library entry.
+{
+    var root = TempRoot("meme-ingest-labels-");
+    var config = new MemeSection { PerceptualThreshold = 0 };
+    Check(config.AiTaggingEnabled, "incoming-image AI labeling is enabled by default");
+    using var store = new MemeStore(root, config);
+    await store.LoadAsync();
+    using var downloader = new MemeDownloader(config, new NetworkSection());
+    using var tagger = new MemeAiTagger(config, new NetworkSection());
+    var calls = 0;
+    tagger.AiChat = (prompt, bytes, mime, _, _) =>
+    {
+        calls++;
+        Check(bytes.SequenceEqual(png) && mime == "image/png" && prompt.Contains("图片本身"),
+            "ingest labeling receives the real image and visual-only label instructions");
+        return Task.FromResult<string?>("""{"caption":"抱牛奶的小黄鸡","tags":["小黄鸡","牛奶"],"emotions":["happy"],"kind":"meme"}""");
+    };
+    var job = new MemeIngestJob { Platform = "qq", ChannelId = "g1",
+        Url = "base64://" + Convert.ToBase64String(png), Summary = "[动态表情]", MessageText = "把这个表情收了" };
+    await using (var queue = new MemeIngestQueue(store, downloader, tagger))
+    {
+        queue.TryEnqueue(job);
+        queue.TryEnqueue(job);
+    }
+    var labeled = store.GetItems().Single();
+    Check(labeled.Caption == "抱牛奶的小黄鸡" && labeled.Tags.SequenceEqual(new[] { "小黄鸡", "牛奶" }) && calls == 1,
+        "automatic collection stores image labels immediately and deduplicates before another model call");
+    await store.RemoveAsync(labeled.Id);
+    tagger.AiChat = (_, _, _, _, _) => Task.FromResult<string?>(null);
+    await using (var queue = new MemeIngestQueue(store, downloader, tagger)) queue.TryEnqueue(job);
+    var fallback = store.GetItems().Single();
+    Check(fallback.Caption == "表情包" && !fallback.Tags.Any(tag => tag.Contains("收") || tag.Contains("动态表情")),
+        "unavailable visual labeling never turns chat collection requests into tags");
+    await store.RemoveAsync(fallback.Id);
+    config.AiTaggingEnabled = false;
+    tagger.AiChat = (_, _, _, _, _) => throw new Exception("Explicit labeling opt-out must be honored");
+    await using (var queue = new MemeIngestQueue(store, downloader, tagger)) queue.TryEnqueue(job);
+    Check(store.GetStats().Count == 1, "explicitly disabled AI labeling keeps collection working without model calls");
 }
 
 // ---- tagging ----
@@ -489,6 +547,30 @@ var png = Convert.FromBase64String(
         }
         catch (OperationCanceledException) { Check(true, "upload cancellation propagated"); }
     }
+
+    // 重复相同关键词、仅一张命中图，以及整个小库都在最近记录内的换图回归。
+    config.Meme.CooldownSeconds = 0;
+    config.Meme.MaxPerHour = 0;
+    config.Meme.PerceptualThreshold = 0;
+    await store.UpdateMetadataAsync(uploadedItem.Id, "猫", ["猫"], ["happy"]);
+    var other = await store.AddAsync(CreateSolidBmp(8, 8, 255, 0, 0), "image/bmp", "狗", ["狗"], ["happy"], new MemeSource(), null);
+    var third = await store.AddAsync(CreateSolidBmp(8, 8, 0, 0, 255), "image/bmp", "鸟", ["鸟"], ["sad"], new MemeSource(), null);
+    var rotationTarget = target with { ChannelId = "rotation" };
+    var firstChoice = await plugin.SelectAsync(new MemeQuery("猫", "happy", "rotation", Limit: 1));
+    Check(firstChoice?.Id == uploadedItem.Id, "rotation initially honors the keyword");
+    await plugin.SendAsync(firstChoice!, rotationTarget);
+    var secondChoice = await plugin.SelectAsync(new MemeQuery("猫", "happy", "rotation", Limit: 1));
+    Check(secondChoice?.Id == other!.Id, "repeated keyword rotates to an unseen meme with the same emotion");
+    await plugin.SendAsync(secondChoice!, rotationTarget);
+    var thirdChoice = await plugin.SelectAsync(new MemeQuery("猫", "happy", "rotation", Limit: 1));
+    Check(thirdChoice?.Id == third!.Id, "rotation broadens emotion before repeating a recent meme");
+    await plugin.SendAsync(thirdChoice!, rotationTarget);
+    var nextChoice = await plugin.SelectAsync(new MemeQuery("鸟", "sad", "rotation", Limit: 1));
+    Check(nextChoice is not null && nextChoice.Id != third!.Id, "a fully recent small library does not repeat the last meme");
+    await store.RemoveAsync(other!.Id);
+    await store.RemoveAsync(third!.Id);
+    var singleChoice = await plugin.SelectAsync(new MemeQuery("猫", ChannelId: "rotation"));
+    Check(singleChoice?.Id == uploadedItem.Id, "single-image library remains usable");
 
     await plugin.OnUnload();
     Check(File.Exists(Path.Combine(root, "config.toml")), "default config template written");

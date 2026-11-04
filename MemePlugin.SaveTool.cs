@@ -9,7 +9,8 @@ namespace ShiroBot.MemePlugin;
 [PluginJson]
 public sealed record SaveMemeToolArgs(
     [property: Description("Short Chinese description of the image being saved. Describe only visible content.")] string Caption,
-    [property: Description("1–16 short Chinese search tags describing visible subjects, actions and emotions.")] string[] Tags);
+    [property: Description("1–16 short Chinese search tags describing visible subjects, actions and emotions.")] string[] Tags,
+    [property: Description("Optional image IDs from AIChat's current-conversation image catalog. Select the image the user explicitly asked to save. Omit for current/quoted attachments.")] int[]? ImageIds = null);
 
 public sealed partial class MemePlugin
 {
@@ -17,7 +18,7 @@ public sealed partial class MemePlugin
         "Save images attached to the current user message, or its quoted message, to the local meme library. Only when the user explicitly asks to save/collect them. Supply a caption and search tags. Returns confirmed storage results and actual tags.",
         PluginJsonSchema.For<SaveMemeToolArgs>(),
         "用户明确要求保存、收藏图片或收进表情库时，调用 save_meme，并填写图片描述和搜索标签。" +
-        "工具读取本条消息的图片，没有时读取引用消息的图片。仅根据看得到的内容标注，不确定时使用概括性标签。" +
+        "工具优先使用 AIChat 提供的图片快照；可用 image_ids 明确选择当前会话历史图片，否则读取本条或引用消息的图片。描述和标签必须对应选中图片的可见内容，禁止使用“收了、保存、图片、动态表情”等请求或占位词充当内容标签。看不到图片时不要猜测。" +
         "必须根据工具结果回复；成功后可以简短告知标签，失败时说明失败，不得只口头承诺已保存。" +
         "保存请求无需调用 send_meme。", MaxCallsPerTurn: 1);
 
@@ -51,6 +52,22 @@ public sealed partial class MemePlugin
             if (type != ChannelType.Direct && !settings.Enabled)
                 return new ChatToolResult("本群表情库已关闭，未保存。");
             var jobs = MemeCollector.BuildJobs(message, _config.Meme, settings, force: true, allowSelf: true);
+            if (chat.Images is { Count: > 0 } snapshots)
+            {
+                if (snapshots.Count > 4 || snapshots.Any(image => image.Base64.Length > 6_700_000) ||
+                    (args.ImageIds is { Length: > 0 } ids && !ids.Distinct().Order().SequenceEqual(snapshots.Select(image => image.Id).Distinct().Order())))
+                    return new ChatToolResult("图片选择无效或过大，未保存。");
+                // AIChat already downloaded exactly the images shown to the model. Avoid a second
+                // fetch of expiring CDN URLs, or choosing a different image from recent chat.
+                jobs = snapshots.Select(image => new MemeIngestJob
+                {
+                    Platform = chat.Platform, InstanceId = chat.InstanceId, ChannelId = chat.ChannelId,
+                    SenderId = chat.SenderId, MessageId = chat.MessageId, Timestamp = message.Timestamp,
+                    Url = "base64://" + image.Base64, Force = true,
+                }).ToList();
+            }
+            else if (args.ImageIds is { Length: > 0 })
+                return new ChatToolResult("当前 AIChat 未提供选中图片的快照，请升级 AIChat 或重新附图，未保存。");
             if (jobs.Count == 0 && message.GetQuote() is { } quote)
             {
                 var quoted = await Context.Message.GetMessageAsync(

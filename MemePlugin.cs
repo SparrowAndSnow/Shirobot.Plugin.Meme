@@ -324,27 +324,43 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         _ = Task.Run(async () =>
         {
             var updated = 0;
+            var removed = 0;
+            var failed = 0;
             try
             {
                 foreach (var item in items)
                 {
                     if (_lifetime.IsCancellationRequested) break;
-                    var path = Path.Combine(store.FilesDirectory, item.FileName);
-                    if (!File.Exists(path)) continue;
+                    try
+                    {
+                        var path = Path.Combine(store.FilesDirectory, item.FileName);
+                        BotLog.Info($"Meme 重新标注处理 id={item.Id[..8]} 文件={item.FileName}");
+                        if (!File.Exists(path)) { failed++; BotLog.Warning($"Meme 重新标注跳过 id={item.Id[..8]}：文件不存在"); continue; }
 
-                    var data = await File.ReadAllBytesAsync(path, _lifetime.Token).ConfigureAwait(false);
-                    var ai = await tagger.TagAsync(data, item.Mime,
-                        $"{item.Caption} {string.Join(" ", item.Tags)}", _lifetime.Token).ConfigureAwait(false);
-                    if (ai is null) continue;
+                        var data = await File.ReadAllBytesAsync(path, _lifetime.Token).ConfigureAwait(false);
+                        var ai = await tagger.TagAsync(data, item.Mime,
+                            $"{item.Caption} {string.Join(" ", item.Tags)}", _lifetime.Token).ConfigureAwait(false);
+                        if (ai is null) { failed++; continue; }
+                        if (_config.Meme.AiFilterNonMeme && ai.Kind is "screenshot" or "photo" or "other")
+                        {
+                            if (await store.QuarantineAsync(item.Id, _lifetime.Token).ConfigureAwait(false)) removed++;
+                            else failed++;
+                            BotLog.Info($"Meme 重新标注清理 id={item.Id[..8]} kind={ai.Kind}：移出表情库，原图保存在 rejected 目录");
+                            continue;
+                        }
 
-                    var caption = string.IsNullOrWhiteSpace(ai.Caption) ? item.Caption : ai.Caption;
-                    var tags = ai.Tags.Count > 0 ? ai.Tags : item.Tags;
-                    var emotions = ai.Emotions.Count > 0 ? ai.Emotions : item.Emotions;
-                    if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, ai.Kind, _lifetime.Token).ConfigureAwait(false))
-                        updated++;
+                        var caption = string.IsNullOrWhiteSpace(ai.Caption) ? item.Caption : ai.Caption;
+                        var tags = ai.Tags.Count > 0 ? ai.Tags : item.Tags;
+                        var emotions = ai.Emotions.Count > 0 ? ai.Emotions : item.Emotions;
+                        if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, ai.Kind, _lifetime.Token).ConfigureAwait(false))
+                            updated++;
+                        else { failed++; BotLog.Warning($"Meme 重新标注写入失败 id={item.Id[..8]}：条目已不存在"); }
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { failed++; BotLog.Warning($"Meme 重新标注失败 id={item.Id[..8]}：{ex.GetType().Name}: {ex.Message}"); }
                 }
 
-                BotLog.Info($"Meme AI 重新标注完成：{updated}/{items.Count} 张");
+                BotLog.Info($"Meme AI 重新标注完成：更新 {updated}，清理 {removed}，失败/跳过 {failed}，总计 {items.Count} 张");
             }
             catch (OperationCanceledException)
             {
@@ -363,11 +379,11 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
 
     private static bool NeedsAiTags(MemeItem item)
     {
-        if (item.Caption is "表情包" or "[图片]" or "[动画表情]" or "[image]" or "[sticker]")
+        if (item.Caption is "表情包" or "[图片]" or "[动态表情]" or "[动画表情]" or "[image]" or "[sticker]")
             return true;
         var generic = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "[图片]", "[动画表情]", "[image]", "[sticker]", "表情", "图片",
+            "[图片]", "[动画表情]", "[动态表情]", "[image]", "[sticker]", "表情", "图片",
         };
         return item.Tags.Count == 0 || item.Tags.All(generic.Contains);
     }
@@ -615,7 +631,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     {
         var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
             [new ChatModelMessage("user", prompt, [new ChatModelImage(mime, Convert.ToBase64String(image))])],
-            model, NeedsVision: true, MaxOutputTokens: 400, Temperature: 0), cancellationToken).ConfigureAwait(false);
+            model, NeedsVision: true, MaxOutputTokens: 2048, Temperature: 0), cancellationToken).ConfigureAwait(false);
         return reply?.Text;
     }
 
@@ -694,27 +710,36 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         var key = string.IsNullOrWhiteSpace(query.ChannelId) ? "global" : query.ChannelId;
         if (IsBlocked(key)) return null;
 
-        var candidates = _store.Search(query.Query, query.Emotion, Math.Max(1, query.Limit));
-        if (candidates.Count == 0 && (!string.IsNullOrWhiteSpace(query.Query) ||
-                                      !string.IsNullOrWhiteSpace(query.Emotion)))
-        {
-            // 模型/用户给的关键词未必命中本地标签；库里非空时退化为随机可用表情，
-            // 避免“明明有图却回复没货”。
-            candidates = _store.Search("", null, Math.Max(1, query.Limit));
-        }
-
-        if (candidates.Count == 0) return null;
-
+        string[] recentIds;
         lock (_recent)
+            recentIds = _recent.TryGetValue(key, out var recent) ? recent.ToArray() : [];
+
+        var excluded = recentIds.ToHashSet(StringComparer.Ordinal);
+        var candidates = SearchAvailable(excluded);
+        if (candidates.Count == 0 && recentIds.Length > 0)
         {
-            if (_recent.TryGetValue(key, out var recent) && recent.Count > 0)
-            {
-                var filtered = candidates.Where(c => !recent.Contains(c.Id)).ToList();
-                if (filtered.Count > 0) candidates = filtered;
-            }
+            // 小库可能全部落在最近 30 张内；开启下一轮，仍避免连续发送上一张。
+            excluded = new HashSet<string>(StringComparer.Ordinal) { recentIds[^1] };
+            candidates = SearchAvailable(excluded);
         }
 
+        // 库里只有一张图片时仍允许发送。
+        if (candidates.Count == 0)
+            candidates = SearchAvailable(null);
+        if (candidates.Count == 0) return null;
         return candidates[Random.Shared.Next(candidates.Count)];
+
+        IReadOnlyList<MemeSelection> SearchAvailable(IReadOnlySet<string>? excludedIds)
+        {
+            var limit = Math.Max(1, query.Limit);
+            var matches = _store.Search(query.Query, query.Emotion, limit, excludedIds);
+            // 关键词仅命中刚发过的图时，先放宽关键词、再放宽情绪，确保能换一张。
+            if (matches.Count == 0 && !string.IsNullOrWhiteSpace(query.Query))
+                matches = _store.Search("", query.Emotion, limit, excludedIds);
+            if (matches.Count == 0 && !string.IsNullOrWhiteSpace(query.Emotion))
+                matches = _store.Search("", null, limit, excludedIds);
+            return matches;
+        }
     }
 
     public async Task<MemeSendResult> SendAsync(
