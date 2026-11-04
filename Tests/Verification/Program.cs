@@ -12,6 +12,8 @@ using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
 var failed = 0;
+FingerprintChecks.Run();
+await StreamingImageChecks.RunAsync();
 
 void Check(bool condition, string name)
 {
@@ -232,6 +234,13 @@ var png = Convert.FromBase64String(
     await store.LoadAsync();
     using var downloader = new MemeDownloader(config, new NetworkSection());
     using var tagger = new MemeAiTagger(config, new NetworkSection());
+    async Task WaitForIngestAsync()
+    {
+        for (var attempt = 0; attempt < 150 && store.GetStats().Count == 0; attempt++) await Task.Delay(20);
+        if (store.GetStats().Count == 0) throw new Exception("Ingest did not complete before unload");
+        // Wait for the store gate so the pending atomic index write completes.
+        await store.LoadAsync();
+    }
     var calls = 0;
     tagger.AiChat = (prompt, bytes, mime, _, _) =>
     {
@@ -246,20 +255,29 @@ var png = Convert.FromBase64String(
     {
         queue.TryEnqueue(job);
         queue.TryEnqueue(job);
+        await WaitForIngestAsync();
     }
     var labeled = store.GetItems().Single();
     Check(labeled.Caption == "抱牛奶的小黄鸡" && labeled.Tags.SequenceEqual(new[] { "小黄鸡", "牛奶" }) && calls == 1,
         "automatic collection stores image labels immediately and deduplicates before another model call");
     await store.RemoveAsync(labeled.Id);
     tagger.AiChat = (_, _, _, _, _) => Task.FromResult<string?>(null);
-    await using (var queue = new MemeIngestQueue(store, downloader, tagger)) queue.TryEnqueue(job);
+    await using (var queue = new MemeIngestQueue(store, downloader, tagger))
+    {
+        queue.TryEnqueue(job);
+        await WaitForIngestAsync();
+    }
     var fallback = store.GetItems().Single();
     Check(fallback.Caption == "表情包" && !fallback.Tags.Any(tag => tag.Contains("收") || tag.Contains("动态表情")),
         "unavailable visual labeling never turns chat collection requests into tags");
     await store.RemoveAsync(fallback.Id);
     config.AiTaggingEnabled = false;
     tagger.AiChat = (_, _, _, _, _) => throw new Exception("Explicit labeling opt-out must be honored");
-    await using (var queue = new MemeIngestQueue(store, downloader, tagger)) queue.TryEnqueue(job);
+    await using (var queue = new MemeIngestQueue(store, downloader, tagger))
+    {
+        queue.TryEnqueue(job);
+        await WaitForIngestAsync();
+    }
     Check(store.GetStats().Count == 1, "explicitly disabled AI labeling keeps collection working without model calls");
 }
 
@@ -381,6 +399,7 @@ var png = Convert.FromBase64String(
         if (method.Name == "AddPage") pages[(string)args![0]!] = (Func<DashboardContext, CancellationToken, Task<UiNode>>)args[2]!;
         return null;
     };
+    IQMessageApi? nativeApi = null;
     var bot = DispatchProxy.Create<IBotContext, TestProxy>();
     ((TestProxy)(object)bot).Call = (method, args) => method.Name switch
     {
@@ -391,7 +410,7 @@ var png = Convert.FromBase64String(
         "get_Message" => messageContext,
         "get_Platform" => "qq",
         "get_InstanceId" => "test",
-        "GetAdapterExtension" => null,
+        "GetAdapterExtension" => nativeApi,
         "UseInstance" => new DummyDisposable(),
         "IsAdmin" => true,
         "get_OwnerList" => Array.Empty<UserReference>(),
@@ -405,14 +424,22 @@ var png = Convert.FromBase64String(
     await plugin.OnLoad(bot);
     var toolInfo = PluginJson.Deserialize<ChatToolInfo>(provided.GetValueOrDefault("chat.tool.send_meme").Metadata.Span);
     Check(provided.ContainsKey("chat.after_reply.send_meme") && toolInfo is { MaxCallsPerTurn: 1 } &&
-          (string?)toolInfo.Parameters?["properties"]?["query"]?["type"] == "string" && toolInfo.Prompt?.Contains("明确要求") == true,
-        "plugin provides the send_meme chat tool and after-reply action through the AIChat contract");
+          (string?)toolInfo.Parameters?["properties"]?["query"]?["type"] == "string" && toolInfo.Prompt is null,
+        "plugin exposes the meme tool without injecting a system prompt");
 
     var storeField = typeof(MemePlugin).GetField("_store", BindingFlags.Instance | BindingFlags.NonPublic)!;
     var store = (MemeStore)storeField.GetValue(plugin)!;
     var item = await store.AddAsync(png, "image/png", "猫猫", ["猫"], ["happy"],
         new MemeSource { Platform = "qq", ChannelId = "g1" }, null);
     Check(item is not null, "plugin store add");
+    var unmatchedTool = await CallAsync<ChatToolCall, ChatToolResult>("chat.tool.send_meme",
+        new ChatToolCall(new JsonObject { ["query"] = "不存在的关键词" },
+            new ChatToolContext("qq", "test", "Group", "unmatched", "m0", "u1", true, false)));
+    Check(unmatchedTool is { AfterReply: null } && sentSegments.Count == 0,
+        "an unmatched AI tool query does not queue or send an unrelated image");
+    var unmatchedContract = await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
+        new MemeSelectRequest("猫", Emotion: "sad", ChannelId: "unmatched"));
+    Check(unmatchedContract is { Meme: null }, "unmatched emotion remains unavailable through the library contract");
 
     var contractSelection = await CallAsync<MemeSelectRequest, MemeSelectResponse>(MemeLibrary.Select.Name,
         new MemeSelectRequest("猫", ChannelId: "contract-group"));
@@ -457,8 +484,12 @@ var png = Convert.FromBase64String(
     }
     sentSegments.Clear();
 
-    var fallback = await plugin.SelectAsync(new MemeQuery("不存在的关键词", ChannelId: "g1"));
-    Check(fallback is not null, "plugin selection falls back to library");
+    var unmatched = await plugin.SelectAsync(new MemeQuery("不存在的关键词", ChannelId: "g1"));
+    Check(unmatched is null, "unmatched keyword does not fall back to a random image");
+    Check(await plugin.SelectAsync(new MemeQuery("", Emotion: "sad", ChannelId: "g1")) is null,
+        "unmatched emotion does not fall back to a random image");
+    Check(await plugin.SelectAsync(new MemeQuery("", ChannelId: "g1")) is not null,
+        "an explicitly unfiltered selection still supports the manual random command");
     var selection = await plugin.SelectAsync(new MemeQuery("猫", ChannelId: "g1"));
     Check(selection is not null && selection.Id == item!.Id, "plugin select");
 
@@ -466,7 +497,46 @@ var png = Convert.FromBase64String(
     var result = await plugin.SendAsync(selection!, target, "猫猫来了");
     Check(result.Success && result.MessageId == "sent-1", "plugin send");
     Check(sentSegments.OfType<ImageSegment>().Any(), "sender uses image segment");
+    var sentImage = sentSegments.OfType<ImageSegment>().Single();
+    Check(new Uri(sentImage.Uri).IsFile && File.ReadAllBytes(new Uri(sentImage.Uri).LocalPath).AsSpan().SequenceEqual(png) &&
+          sentImage.FileName == Path.GetFileName(selection!.FilePath), "sender passes the unchanged local image file and filename without Base64 copying");
     Check(sentSegments.OfType<TextSegment>().Any(t => t.Text.Contains("猫猫来了")), "sender includes caption");
+    nativeApi = DispatchProxy.Create<IQMessageApi, TestProxy>();
+    var nativeImageSeen = false;
+    ((TestProxy)(object)nativeApi).Call = (method, args) =>
+    {
+        var outgoing = (IReadOnlyList<QOutgoingSegment>)args![2]!;
+        var image = outgoing.OfType<QOutgoingImage>().Single();
+        nativeImageSeen = new Uri(image.Uri).IsFile && image.SubType == "sticker" && image.Summary == "native";
+        return Task.FromResult("native-1");
+    };
+    var sender = new MemeSender(bot, config.Meme);
+    var nativeResult = await sender.SendAsync(selection!, target, "native", default);
+    Check(nativeResult is { Success: true, MessageId: "native-1" } && nativeImageSeen,
+        "native sender preserves local file URI, sticker subtype and caption");
+    ((TestProxy)(object)nativeApi).Call = (_, _) => throw new HttpRequestException("local fixture upload failure");
+    sentSegments.Clear();
+    var fallbackResult = await sender.SendAsync(selection!, target, "fallback", default);
+    Check(fallbackResult.Success && sentSegments.OfType<ImageSegment>().Single().Uri == sentImage.Uri,
+        "failed native upload falls back to the same unchanged local image");
+    using (var stop = new CancellationTokenSource())
+    {
+        ((TestProxy)(object)nativeApi).Call = (_, _) => { stop.Cancel(); return Task.FromCanceled<string>(stop.Token); };
+        sentSegments.Clear();
+        try { await sender.SendAsync(selection!, target, "cancel", stop.Token); Check(false, "canceled native send propagates"); }
+        catch (OperationCanceledException) { Check(sentSegments.Count == 0, "canceled native send propagates without fallback upload"); }
+    }
+    nativeApi = null;
+    var largeSendPath = Path.Combine(root, "发送 #% image.png");
+    using (var file = File.Create(largeSendPath)) { file.Write(png); file.SetLength(4_000_000); }
+    sentSegments.Clear();
+    var largeSelection = selection! with { FilePath = largeSendPath };
+    long sendBefore = GC.GetAllocatedBytesForCurrentThread();
+    var largeResult = await sender.SendAsync(largeSelection, target, "large", default);
+    long sendAllocated = GC.GetAllocatedBytesForCurrentThread() - sendBefore;
+    var largeSent = sentSegments.OfType<ImageSegment>().Single();
+    Check(largeResult.Success && new Uri(largeSent.Uri).LocalPath == largeSendPath && sendAllocated < 128_000,
+        $"4 MB send preserves escaped file paths and allocates only {sendAllocated} bytes before adapter handling");
     Check((await plugin.SelectAsync(new MemeQuery("猫", ChannelId: "g1"))) is null, "cooldown blocks second select");
 
     // AI 聊天工具：只选图并要求回复后发送；没有文字时带配文、按要求 @。
@@ -553,20 +623,23 @@ var png = Convert.FromBase64String(
     config.Meme.MaxPerHour = 0;
     config.Meme.PerceptualThreshold = 0;
     await store.UpdateMetadataAsync(uploadedItem.Id, "猫", ["猫"], ["happy"]);
-    var other = await store.AddAsync(CreateSolidBmp(8, 8, 255, 0, 0), "image/bmp", "狗", ["狗"], ["happy"], new MemeSource(), null);
+    var other = await store.AddAsync(CreateSolidBmp(8, 8, 255, 0, 0), "image/bmp", "狗", ["猫", "狗"], ["happy"], new MemeSource(), null);
     var third = await store.AddAsync(CreateSolidBmp(8, 8, 0, 0, 255), "image/bmp", "鸟", ["鸟"], ["sad"], new MemeSource(), null);
     var rotationTarget = target with { ChannelId = "rotation" };
     var firstChoice = await plugin.SelectAsync(new MemeQuery("猫", "happy", "rotation", Limit: 1));
     Check(firstChoice?.Id == uploadedItem.Id, "rotation initially honors the keyword");
     await plugin.SendAsync(firstChoice!, rotationTarget);
     var secondChoice = await plugin.SelectAsync(new MemeQuery("猫", "happy", "rotation", Limit: 1));
-    Check(secondChoice?.Id == other!.Id, "repeated keyword rotates to an unseen meme with the same emotion");
+    Check(secondChoice?.Id == other!.Id, "repeated keyword rotates to an unseen matching meme with the same emotion");
     await plugin.SendAsync(secondChoice!, rotationTarget);
     var thirdChoice = await plugin.SelectAsync(new MemeQuery("猫", "happy", "rotation", Limit: 1));
-    Check(thirdChoice?.Id == third!.Id, "rotation broadens emotion before repeating a recent meme");
+    Check(thirdChoice?.Id == uploadedItem.Id, "rotation reuses a matching meme instead of broadening keyword or emotion");
     await plugin.SendAsync(thirdChoice!, rotationTarget);
-    var nextChoice = await plugin.SelectAsync(new MemeQuery("鸟", "sad", "rotation", Limit: 1));
-    Check(nextChoice is not null && nextChoice.Id != third!.Id, "a fully recent small library does not repeat the last meme");
+    var birdChoice = await plugin.SelectAsync(new MemeQuery("鸟", "sad", "rotation", Limit: 1));
+    Check(birdChoice?.Id == third!.Id, "a different query selects its own matching image");
+    await plugin.SendAsync(birdChoice!, rotationTarget);
+    var nextChoice = await plugin.SelectAsync(new MemeQuery("", ChannelId: "rotation", Limit: 1));
+    Check(nextChoice is not null && nextChoice.Id != third!.Id, "manual random selection avoids the last image in a fully recent library");
     await store.RemoveAsync(other!.Id);
     await store.RemoveAsync(third!.Id);
     var singleChoice = await plugin.SelectAsync(new MemeQuery("猫", ChannelId: "rotation"));

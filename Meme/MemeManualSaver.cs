@@ -10,7 +10,7 @@ internal static class MemeManualSaver
         if (downloaded is null || downloaded.Data.Length > store.Config.MaxBytes ||
             MemeDownloader.SniffMime(downloaded.Data) is not { } mime)
             return "保存失败：图片下载失败、格式不支持或超过大小限制。";
-        var existing = store.FindExisting(downloaded.Data, job.MarketFace);
+        var existing = store.FindExisting(downloaded.Data, job.MarketFace, out var fingerprint);
 
         var mergedTags = tags.Select(t => t.Trim()).ToList();
         var emotions = MemeTagging.GuessEmotions(caption + " " + string.Join(" ", tags));
@@ -23,7 +23,7 @@ internal static class MemeManualSaver
             {
                 Platform = job.Platform, InstanceId = job.InstanceId, ChannelId = job.ChannelId,
                 SenderId = job.SenderId, MessageId = job.MessageId, Timestamp = job.Timestamp,
-            }, job.MarketFace, kind, ct).ConfigureAwait(false);
+            }, job.MarketFace, kind, ct, precomputedFingerprint: fingerprint).ConfigureAwait(false);
         if (item is not null)
         {
             // Auto-collection can win the race and create an entry with chat text as tags.

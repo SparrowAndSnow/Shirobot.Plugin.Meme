@@ -124,7 +124,8 @@ internal sealed class MemeStore : IDisposable
         MemeSource source,
         MarketFaceInfo? marketFace,
         string? kind = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        MemeFingerprint? precomputedFingerprint = null)
     {
         if (data.Length == 0 || data.Length > Config.MaxBytes)
             return null;
@@ -145,7 +146,7 @@ internal sealed class MemeStore : IDisposable
             MemeFingerprint? fingerprint = null;
             if (Config.PerceptualThreshold > 0)
             {
-                fingerprint = MemePerceptualHash.Compute(data);
+                fingerprint = precomputedFingerprint ?? MemePerceptualHash.Compute(data);
                 if (fingerprint is { } candidate)
                 {
                     lock (_sync)
@@ -259,7 +260,11 @@ internal sealed class MemeStore : IDisposable
     }
 
     public MemeItem? FindExisting(byte[] data, MarketFaceInfo? marketFace)
+        => FindExisting(data, marketFace, out _);
+
+    public MemeItem? FindExisting(byte[] data, MarketFaceInfo? marketFace, out MemeFingerprint? fingerprint)
     {
+        fingerprint = null;
         if (data.Length == 0) return null;
         var hash = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
         lock (_sync)
@@ -270,7 +275,7 @@ internal sealed class MemeStore : IDisposable
         }
 
         if (Config.PerceptualThreshold <= 0) return null;
-        var fingerprint = MemePerceptualHash.Compute(data);
+        fingerprint = MemePerceptualHash.Compute(data);
         if (fingerprint is not { } candidate) return null;
         lock (_sync)
         {

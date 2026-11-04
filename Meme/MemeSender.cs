@@ -19,20 +19,22 @@ internal sealed class MemeSender(IBotContext bot, MemeSection config)
         if (!File.Exists(selection.FilePath))
             return new MemeSendResult(false, Error: "表情文件不存在");
 
-        byte[] data;
+        cancellationToken.ThrowIfCancellationRequested();
+        string uri;
         try
         {
             var info = new FileInfo(selection.FilePath);
             if (info.Length <= 0 || info.Length > config.MaxBytes)
                 return new MemeSendResult(false, Error: "表情文件超过大小限制");
-            data = await File.ReadAllBytesAsync(selection.FilePath, cancellationToken).ConfigureAwait(false);
+            // Leave file access / remote Base64 upload to the adapter instead of
+            // retaining both a full byte[] and a Base64 string during the send.
+            uri = new Uri(Path.GetFullPath(selection.FilePath)).AbsoluteUri;
         }
         catch (Exception ex)
         {
             return new MemeSendResult(false, Error: ex.Message);
         }
 
-        var uri = "base64://" + Convert.ToBase64String(data);
         var text = TrimCaption(caption, config.CaptionMaxChars);
 
         IDisposable? scope = null;
@@ -79,6 +81,7 @@ internal sealed class MemeSender(IBotContext bot, MemeSection config)
                         .ConfigureAwait(false);
                     return new MemeSendResult(true, messageId);
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch (Exception ex)
                 {
                     // OneBot/Milky 适配器不一定实现 QOutgoingImage.SubType；回退通用图片段。
@@ -94,6 +97,7 @@ internal sealed class MemeSender(IBotContext bot, MemeSection config)
                     ? new MemeSendResult(true, sent.MessageId)
                     : new MemeSendResult(false, Error: sent.ErrorMessage ?? "发送失败");
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 return new MemeSendResult(false, Error: ex.Message);
@@ -111,7 +115,7 @@ internal sealed class MemeSender(IBotContext bot, MemeSection config)
             segments.Add(new QuoteSegment(target.MessageId));
         if (target.Mention && target.IsGroup && !string.IsNullOrWhiteSpace(target.SenderId))
             segments.Add(new MentionSegment(target.SenderId));
-        segments.Add(new ImageSegment(uri) { Summary = caption });
+        segments.Add(new ImageSegment(uri) { Summary = caption, FileName = Path.GetFileName(new Uri(uri).LocalPath) });
         if (caption.Length > 0)
             segments.Add(new TextSegment(" " + caption));
         return segments;

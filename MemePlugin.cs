@@ -43,7 +43,6 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         download_timeout_seconds = 15
         library_dir = "memes"
         ai_tool_enabled = true
-        ai_tool_policy = "explicit"
         ai_tagging_enabled = false
         ai_provider = "auto"
         ai_base_url = ""
@@ -629,13 +628,36 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     /// <summary>借用 AI 聊天插件的识图模型做标注；AI 聊天插件不在时返回 null。</summary>
     private async Task<string?> TagWithAiChatModelAsync(string prompt, byte[] image, string mime, string? model, CancellationToken cancellationToken)
     {
-        var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
-            [new ChatModelMessage("user", prompt, [new ChatModelImage(mime, Convert.ToBase64String(image))])],
-            model, NeedsVision: true, MaxOutputTokens: 2048, Temperature: 0), cancellationToken).ConfigureAwait(false);
-        return reply?.Text;
+        var models = await ChatModels.List.TryCallAsync(Context, cancellationToken).ConfigureAwait(false);
+        string? path = null;
+        try
+        {
+            ChatModelImage input;
+            if (models?.SupportsImageFiles == true)
+            {
+                var temporary = Context.CreateTempDirectory(TimeSpan.FromMinutes(10));
+                path = Path.Combine(temporary.Path, "tagging-image");
+                await File.WriteAllBytesAsync(path, image, cancellationToken).ConfigureAwait(false);
+                input = new ChatModelImage(mime, FilePath: path);
+            }
+            else input = new ChatModelImage(mime, Convert.ToBase64String(image));
+            var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
+                [new ChatModelMessage("user", prompt, [input])],
+                model, NeedsVision: true, MaxOutputTokens: 2048, Temperature: 0), cancellationToken).ConfigureAwait(false);
+            return reply?.Text;
+        }
+        finally
+        {
+            if (path is not null)
+            {
+                try { File.Delete(path); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
     }
 
-    /// <summary>按配置注册或注销聊天工具；说明随使用倾向变化，所以每次重新注册。</summary>
+    /// <summary>注册表情工具；是否调用由 AIChat 的模型和人设决定。</summary>
     private void UpdateChatTool()
     {
         _chatTool?.Dispose();
@@ -643,25 +665,16 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         _saveChatTool?.Dispose();
         _saveChatTool = null;
         if (!_config.Meme.Enabled || !_config.Meme.AiToolEnabled) return;
-        _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor(_config.Meme.AiToolPolicy));
+        _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor());
         _saveChatTool = ChatTools.Tools.Provide(Context, "save_meme", HandleSaveMemeAsync, SaveToolInfo());
     }
 
-    internal static ChatToolInfo ChatToolInfoFor(string policy)
+    internal static ChatToolInfo ChatToolInfoFor()
     {
-        var auto = string.Equals(policy, "auto", StringComparison.OrdinalIgnoreCase);
         return new ChatToolInfo(
-            auto
-                ? "Select one suitable meme from the local meme library for the current chat. Use proactively in casual conversation, banter, teasing, or emotional replies; do not use for serious answers. The meme is sent after your reply."
-                : "Select one suitable meme from the local meme library, only when the user explicitly asks for a meme or sticker. The meme is sent after your reply.",
+            "Select one local meme matching the supplied keyword and/or emotion and send it after the current reply. " +
+            "Returns unavailable when no matching meme exists or the conversation is in cooldown.",
             PluginJsonSchema.For<SendMemeToolArgs>(),
-            auto
-                ? "你有一个本地表情库。回复别人时，如果语气轻松、在接梗、吐槽、卖萌、打招呼或表达情绪，应主动调用 send_meme 配一张表情，" +
-                  "不需要等用户明确要求。严肃回答、求助、工作/学习问题不要发；每次回复最多一张，不要连续发。" +
-                  "调用后最终回复只写一句很短的点评或接梗，不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。"
-                : "你有一个本地表情库。只有在用户明确要求发表情、斗图或使用表情时才调用 send_meme；" +
-                  "用户没有明确要求时不要主动发。每次回复最多一张，不要连续发。调用后最终回复只写一句很短的点评或接梗，" +
-                  "不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。",
             MaxCallsPerTurn: 1);
     }
 
@@ -677,10 +690,10 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         var selection = await SelectAsync(new MemeQuery(query, emotion, call.Context.ChannelId, call.Context.SenderId), cancellationToken)
             .ConfigureAwait(false);
         if (selection is null)
-            return new ChatToolResult("No suitable meme is available right now, or this conversation is in cooldown. Reply with text instead.");
+            return new ChatToolResult("No matching meme is available, or this conversation is in cooldown. No image has been queued.");
 
         var content = $"Selected a meme ({selection.Caption}; tags: {string.Join(", ", selection.Tags)}). " +
-                      "It is sent after your reply. Keep the reply to one short sentence; do not describe the image.";
+                      "It is queued for sending after your reply.";
         return new ChatToolResult(content,
             new ChatAfterReply(ChatToolName, PluginJson.ToNode(new SendMemeArgs(selection.Id, args?.Caption))!.AsObject()));
     }
@@ -732,13 +745,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         IReadOnlyList<MemeSelection> SearchAvailable(IReadOnlySet<string>? excludedIds)
         {
             var limit = Math.Max(1, query.Limit);
-            var matches = _store.Search(query.Query, query.Emotion, limit, excludedIds);
-            // 关键词仅命中刚发过的图时，先放宽关键词、再放宽情绪，确保能换一张。
-            if (matches.Count == 0 && !string.IsNullOrWhiteSpace(query.Query))
-                matches = _store.Search("", query.Emotion, limit, excludedIds);
-            if (matches.Count == 0 && !string.IsNullOrWhiteSpace(query.Emotion))
-                matches = _store.Search("", null, limit, excludedIds);
-            return matches;
+            return _store.Search(query.Query, query.Emotion, limit, excludedIds);
         }
     }
 

@@ -99,39 +99,15 @@ internal sealed class MemeAiTagger : IDisposable
         var prompt = BuildPrompt(config, contextText);
         if (!UsesCustomEndpoint(config)) return await TagWithAiChatAsync(config, prompt, data, mime, cancellationToken).ConfigureAwait(false);
 
-        var body = new
-        {
-            model = config.AiModel,
-            messages = new object[]
-            {
-                new
-                {
-                    role = "user",
-                    content = new object[]
-                    {
-                        new { type = "text", text = prompt },
-                        new
-                        {
-                            type = "image_url",
-                            image_url = new { url = $"data:{mime};base64,{Convert.ToBase64String(data)}" }
-                        }
-                    }
-                }
-            },
-            temperature = 0,
-            max_tokens = 2048,
-            // DeepSeek/部分兼容服务支持关闭思考；不支持的实现会忽略该字段。
-            chat_template_kwargs = new { enable_thinking = false }
-        };
-
         var endpoint = config.AiBaseUrl.Trim().TrimEnd('/');
         if (!endpoint.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase))
             endpoint += "/chat/completions";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
-            Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
+            Content = new StreamingMemeImageContent(config.AiModel, prompt, data, mime)
         };
+        request.Content.Headers.ContentType = new("application/json");
         if (!string.IsNullOrWhiteSpace(config.AiApiKey))
             request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.AiApiKey.Trim());
 
