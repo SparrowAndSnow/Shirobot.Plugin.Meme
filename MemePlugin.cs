@@ -69,6 +69,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
     private IDisposable? _chatTool;
+    private IDisposable? _saveChatTool;
 
     private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
 
@@ -622,8 +623,11 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     {
         _chatTool?.Dispose();
         _chatTool = null;
+        _saveChatTool?.Dispose();
+        _saveChatTool = null;
         if (!_config.Meme.Enabled || !_config.Meme.AiToolEnabled) return;
         _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor(_config.Meme.AiToolPolicy));
+        _saveChatTool = ChatTools.Tools.Provide(Context, "save_meme", HandleSaveMemeAsync, SaveToolInfo());
     }
 
     internal static ChatToolInfo ChatToolInfoFor(string policy)

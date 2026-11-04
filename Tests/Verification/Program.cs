@@ -556,6 +556,8 @@ static byte[] CreateBmp(int width, int height, bool invert)
     return bytes;
 }
 
+failed += await SaveToolVerification.RunAsync();
+
 Console.WriteLine(failed == 0 ? "ALL CHECKS PASSED" : $"{failed} CHECK(S) FAILED");
 return failed == 0 ? 0 : 1;
 

@@ -11,10 +11,11 @@ internal static class MemeCollector
         MessageEvent message,
         MemeSection config,
         GroupSettings? groupSettings,
-        bool force)
+        bool force,
+        bool allowSelf = false)
     {
         var jobs = new List<MemeIngestJob>();
-        if (string.Equals(message.Sender.Id, message.SelfId, StringComparison.Ordinal))
+        if (!allowSelf && string.Equals(message.Sender.Id, message.SelfId, StringComparison.Ordinal))
             return jobs;
 
         var autoCollect = (groupSettings?.AutoCollect ?? config.AutoCollect).Trim().ToLowerInvariant();

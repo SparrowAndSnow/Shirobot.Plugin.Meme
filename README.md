@@ -1,7 +1,7 @@
 # ShiroBot MemePlugin
 
 独立的表情包插件：本地表情库、群聊自动采集（“盗图”）、QQ 商城表情入库、
-按关键词/情绪检索，向 AI 聊天插件提供 `send_meme`，并通过 `MemeLibrary` 契约供其他插件选图、发图和查询容量。
+按关键词/情绪检索，向 AI 聊天插件提供 `send_meme` 和 `save_meme`，并通过 `MemeLibrary` 契约供其他插件选图、发图和查询容量。
 
 ## 能力
 
@@ -113,7 +113,7 @@ send_mode = "auto"         # auto / sticker / image
 caption_max_chars = 120
 download_timeout_seconds = 15
 library_dir = "memes"
-ai_tool_enabled = true     # 向 AI 聊天插件提供 send_meme 工具
+ai_tool_enabled = true     # 向 AI 聊天插件提供发图、保存工具
 ai_tool_policy = "explicit" # explicit：用户明确要求时才发；auto：轻松聊天时主动配图
 ai_tagging_enabled = false # 启用多模态 AI 标注
 ai_provider = "auto"       # auto：填了 ai_base_url 用自己的接口，否则借用 AI 聊天插件的模型；aichat / custom 固定其一
@@ -166,11 +166,15 @@ AI 失败或超时自动回退到本地关键词规则。已有表情可用 `#me
 
 ## 与 AI 聊天插件配合
 
-Meme 通过 AIChat 的 `ChatTools` 契约提供 `chat.tool.send_meme` 和 `chat.after_reply.send_meme`。
+Meme 通过 AIChat 的 `ChatTools` 契约提供 `chat.tool.send_meme`、`chat.after_reply.send_meme` 和 `chat.tool.save_meme`。
 工具负责选图，AIChat 发完文字后调用回复后动作发图；运行时只交换 JSON，不共享服务对象。
 Meme 的 AI 标注通过 `ChatModels` 契约借用 AIChat 的识图模型，与 Dashboard 页面接口互相独立。
 
-这项工具由 Meme 的 `ai_tool_enabled` 和 `ai_tool_policy` 控制。AIChat 按 `ChatTools` 契约发现工具，
+用户明确要求保存图片时，AIChat 可调用 `save_meme`，提供简短描述和搜索标签。Meme 优先读取本条消息的图片，没有时读取引用消息；每次最多保存四张，包括机器人发出的图片。保存会检查格式、大小和重复图片，并等待实际入库后返回描述和标签。已有图片直接返回原标签。开启 AI 标注时，还会用识图模型补充描述、标签和情绪。
+
+这属于手动收录，不受自动采集白名单、采集模式和非表情过滤限制；群内关闭表情库后仍不能保存。工具不接受模型传入的 URL、文件路径或任意消息 ID。
+
+两个工具由 `ai_tool_enabled` 统一控制，`ai_tool_policy` 只控制发图倾向；保存工具仅用于用户明确提出的请求，主动聊天不能调用。AIChat 按 `ChatTools` 契约发现工具，
 没有安装 Meme 时也可以正常聊天；无需配置已经移除的 `[tool_use.meme]` 专用桥接。
 
 ## QQ 商城表情说明
