@@ -129,6 +129,17 @@ internal static class SaveToolVerification
                 "snapshot image IDs must match the model selection");
             Check((await Call(chat, snapshotArgs)).Contains("未保存") && store.GetStats().Count == 0,
                 "old AIChat cannot silently substitute another attachment for selected history images");
+            var subsetSnapshots = new[]
+            {
+                new ChatToolImage(2, "image/png", Convert.ToBase64String(png)),
+                new ChatToolImage(3, "image/png", Convert.ToBase64String(png)),
+            };
+            var subsetArgs = Args();
+            subsetArgs["image_ids"] = new JsonArray(2);
+            saved = await Call(chat with { Images = subsetSnapshots }, subsetArgs);
+            Check(saved.Contains("已保存") && store.GetStats().Count == 1,
+                "save tool accepts a subset of AIChat snapshot IDs");
+            await store.RemoveAsync(store.GetItems().Single().Id);
             messages["request"] = message with { Segments = [new ImageSegment("base64://" + Convert.ToBase64String("not an image"u8.ToArray()))] };
             Check((await Call()).Contains("保存失败") && store.GetStats().Count == 0, "save tool rejects invalid image bytes");
             messages["request"] = message;

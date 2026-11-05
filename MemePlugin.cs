@@ -79,15 +79,19 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         return Task.CompletedTask;
     }
 
-    protected override Task OnConfigChangedAsync(MemeConfig previous, MemeConfig current, CancellationToken cancellationToken)
+    protected override async Task OnConfigChangedAsync(MemeConfig previous, MemeConfig current, CancellationToken cancellationToken)
     {
         _config = current;
         _store?.UpdateConfig(current.Meme);
         if (_sender is not null && Context is not null)
             _sender = new MemeSender(Context, current.Meme);
-        _tagger?.UpdateConfig(current.Meme, current.Network);
+        if (_tagger is not null)
+        {
+            _tagger.AiChat = null;
+            _tagger.UpdateConfig(current.Meme, current.Network);
+            await EnsureAiChatTaggerAsync(CancellationToken.None).ConfigureAwait(false);
+        }
         if (_store is not null) UpdateChatTool();
-        return Task.CompletedTask;
     }
 
     protected override void ConfigureRoutes()
@@ -108,7 +112,8 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         await _store.LoadAsync().ConfigureAwait(false);
 
         _downloader = new MemeDownloader(_config.Meme, _config.Network);
-        _tagger = new MemeAiTagger(_config.Meme, _config.Network) { AiChat = TagWithAiChatModelAsync };
+        _tagger = new MemeAiTagger(_config.Meme, _config.Network);
+        await EnsureAiChatTaggerAsync(CancellationToken.None).ConfigureAwait(false);
         _queue = new MemeIngestQueue(_store, _downloader, _tagger);
         _sender = new MemeSender(Context, _config.Meme);
 
@@ -123,6 +128,11 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         if (_queue is not null)
             await _queue.DisposeAsync().ConfigureAwait(false);
         _queue = null;
+
+        _chatTool?.Dispose();
+        _chatTool = null;
+        _saveChatTool?.Dispose();
+        _saveChatTool = null;
 
         _lifetime.Cancel();
         _downloader?.Dispose();
@@ -292,7 +302,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
             return;
         }
 
-        if (_tagger is null || !_tagger.IsConfigured)
+        if (_tagger is null || (!_tagger.IsConfigured && !await EnsureAiChatTaggerAsync(CancellationToken.None).ConfigureAwait(false)))
         {
             await ReplyTextAsync(message, "AI 标注不可用：请开启 AI 标注，并安装 AI 聊天插件借用它的模型，或在“表情库设置”里填写自己的 AI 接口地址和模型。").ConfigureAwait(false);
             return;
@@ -625,7 +635,27 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
 
     private const string ChatToolName = "send_meme";
 
-    /// <summary>借用 AI 聊天插件的识图模型做标注；AI 聊天插件不在时返回 null。</summary>
+    /// <summary>Probe the AIChat named model service before advertising AI tagging.</summary>
+    private async Task<bool> EnsureAiChatTaggerAsync(CancellationToken cancellationToken)
+    {
+        if (_tagger is null || !_config.Meme.AiTaggingEnabled ||
+            MemeAiTagger.UsesCustomEndpoint(_config.Meme) || _tagger.AiChat is not null)
+            return _tagger?.IsConfigured == true;
+
+        try
+        {
+            var models = await ChatModels.List.TryCallAsync(Context, cancellationToken).ConfigureAwait(false);
+            if (models is null) return false;
+            _tagger.AiChat = TagWithAiChatModelAsync;
+            return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            BotLog.Warning($"Meme AI 标注检查 AIChat 契约失败：{ex.Message}");
+            return false;
+        }
+    }
+
     private async Task<string?> TagWithAiChatModelAsync(string prompt, byte[] image, string mime, string? model, CancellationToken cancellationToken)
     {
         var models = await ChatModels.List.TryCallAsync(Context, cancellationToken).ConfigureAwait(false);
@@ -704,8 +734,9 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     private async Task<ChatAfterReplyResult> HandleAfterReplyAsync(ChatAfterReplyCall call, CancellationToken cancellationToken)
     {
         var args = call.Arguments.As<SendMemeArgs>();
-        var selection = args is null ? null : _store?.GetById(args.Id);
-        if (selection is null) return new ChatAfterReplyResult(false, "未找到该表情");
+        var selection = string.IsNullOrWhiteSpace(args?.Id) ? null : _store?.GetById(args.Id);
+        if (selection is null || !string.Equals(selection.Id, args!.Id, StringComparison.Ordinal))
+            return new ChatAfterReplyResult(false, "未找到该表情");
 
         var caption = call.Reply.TextSent ? "" : args!.Caption?.Trim() ?? "";
         var context = call.Context;

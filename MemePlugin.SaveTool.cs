@@ -54,12 +54,19 @@ public sealed partial class MemePlugin
             var jobs = MemeCollector.BuildJobs(message, _config.Meme, settings, force: true, allowSelf: true);
             if (chat.Images is { Count: > 0 } snapshots)
             {
-                if (snapshots.Count > 4 || snapshots.Any(image => image.Base64.Length > 6_700_000) ||
-                    (args.ImageIds is { Length: > 0 } ids && !ids.Distinct().Order().SequenceEqual(snapshots.Select(image => image.Id).Distinct().Order())))
+                if (snapshots.Count > 4 || snapshots.Any(image => image.Base64.Length > 6_700_000))
                     return new ChatToolResult("图片选择无效或过大，未保存。");
+                var selected = snapshots;
+                if (args.ImageIds is { Length: > 0 } ids)
+                {
+                    var wanted = ids.Distinct().ToHashSet();
+                    if (!wanted.IsSubsetOf(snapshots.Select(image => image.Id)))
+                        return new ChatToolResult("图片选择无效，未保存。");
+                    selected = snapshots.Where(image => wanted.Contains(image.Id)).ToArray();
+                }
                 // AIChat already downloaded exactly the images shown to the model. Avoid a second
                 // fetch of expiring CDN URLs, or choosing a different image from recent chat.
-                jobs = snapshots.Select(image => new MemeIngestJob
+                jobs = selected.Select(image => new MemeIngestJob
                 {
                     Platform = chat.Platform, InstanceId = chat.InstanceId, ChannelId = chat.ChannelId,
                     SenderId = chat.SenderId, MessageId = chat.MessageId, Timestamp = message.Timestamp,
