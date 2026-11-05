@@ -7,7 +7,7 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.meme", ShiroBotPackageKind.Plugin, "1.0.2")]
+[assembly: ShiroBotPackage("shirobot.plugin.meme", ShiroBotPackageKind.Plugin, "1.0.3")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.MemePlugin;
@@ -15,7 +15,7 @@ namespace ShiroBot.MemePlugin;
 [BotPlugin(
     "MemePlugin",
     Name = "表情包插件",
-    Version = "1.0.2",
+    Version = "1.0.3",
     Description = "本地表情库、群聊盗图采集、QQ 商城表情降级发送，并向其他插件提供表情服务。",
     Author = "SparrowAndSnow",
     GithubRepo = "SparrowAndSnow/Shirobot.Plugin.Meme",
