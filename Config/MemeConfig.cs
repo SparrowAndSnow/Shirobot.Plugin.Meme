@@ -78,7 +78,7 @@ public sealed class MemeSection
     [ConfigField("模型来源：auto 填了接口地址就用自己的接口，否则借用 AI 聊天插件的模型；aichat 只借用 AI 聊天插件的模型；custom 只用自己的接口。", Label = "模型来源", Options = new[] { "auto", "aichat", "custom" }, Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiProvider { get; set; } = "auto";
 
-    [ConfigField("自己的 OpenAI 兼容视觉接口，例如 http://10.157.0.10:8888/v1；借用 AI 聊天插件的模型时留空。", Label = "AI 接口地址", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
+    [ConfigField("自己的 OpenAI 兼容视觉接口，例如 http://127.0.0.1:3080/v1；借用 AI 聊天插件的模型时留空。", Label = "AI 接口地址", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
     public string AiBaseUrl { get; set; } = "";
 
     [ConfigField("AI API Key；本地免鉴权服务可留空。", Label = "AI API Key", Type = "password", Group = "ai", GroupLabel = "AI 标注", GroupOrder = 50)]
