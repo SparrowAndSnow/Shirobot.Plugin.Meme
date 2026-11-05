@@ -15,10 +15,17 @@ internal static class MemePerceptualHash
     {
         try
         {
+            if (PngFingerprint.IsPng(data)) return PngFingerprint.Compute(data);
             using var header = new MemoryStream(data, writable: false);
             var info = ImageInfo.FromStream(header);
             if (info is not { Width: > 0 and <= 8192, Height: > 0 and <= 8192 })
                 return null;
+
+            // The legacy decoder allocates both native and managed full-size RGBA.
+            // Large JPEGs can be processed in scanlines; unsupported large formats
+            // retain SHA-256 deduplication and collection without a full pixel decode.
+            if ((long)info.Value.Width * info.Value.Height > 1_048_576)
+                return JpegFingerprint.Compute(data);
 
             var image = ImageResult.FromMemory(data, ColorComponents.RedGreenBlueAlpha);
             if (image.Width <= 0 || image.Height <= 0 || image.Data is null)

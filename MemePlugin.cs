@@ -17,7 +17,8 @@ namespace ShiroBot.MemePlugin;
     Name = "表情包插件",
     Version = "1.0.2",
     Description = "本地表情库、群聊盗图采集、QQ 商城表情降级发送，并向其他插件提供表情服务。",
-    Author = "ShirokaProject",
+    Author = "SparrowAndSnow",
+    GithubRepo = "SparrowAndSnow/Shirobot.Plugin.Meme",
     Category = PluginCategory.Media,
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -42,7 +43,6 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         download_timeout_seconds = 15
         library_dir = "memes"
         ai_tool_enabled = true
-        ai_tool_policy = "explicit"
         ai_tagging_enabled = false
         ai_provider = "auto"
         ai_base_url = ""
@@ -69,6 +69,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly Dictionary<string, ChannelUsage> _usage = new(StringComparer.Ordinal);
     private IDisposable? _chatTool;
+    private IDisposable? _saveChatTool;
 
     private readonly Dictionary<string, Queue<string>> _recent = new(StringComparer.Ordinal);
 
@@ -78,15 +79,19 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         return Task.CompletedTask;
     }
 
-    protected override Task OnConfigChangedAsync(MemeConfig previous, MemeConfig current, CancellationToken cancellationToken)
+    protected override async Task OnConfigChangedAsync(MemeConfig previous, MemeConfig current, CancellationToken cancellationToken)
     {
         _config = current;
         _store?.UpdateConfig(current.Meme);
         if (_sender is not null && Context is not null)
             _sender = new MemeSender(Context, current.Meme);
-        _tagger?.UpdateConfig(current.Meme, current.Network);
+        if (_tagger is not null)
+        {
+            _tagger.AiChat = null;
+            _tagger.UpdateConfig(current.Meme, current.Network);
+            await EnsureAiChatTaggerAsync(CancellationToken.None).ConfigureAwait(false);
+        }
         if (_store is not null) UpdateChatTool();
-        return Task.CompletedTask;
     }
 
     protected override void ConfigureRoutes()
@@ -107,7 +112,8 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         await _store.LoadAsync().ConfigureAwait(false);
 
         _downloader = new MemeDownloader(_config.Meme, _config.Network);
-        _tagger = new MemeAiTagger(_config.Meme, _config.Network) { AiChat = TagWithAiChatModelAsync };
+        _tagger = new MemeAiTagger(_config.Meme, _config.Network);
+        await EnsureAiChatTaggerAsync(CancellationToken.None).ConfigureAwait(false);
         _queue = new MemeIngestQueue(_store, _downloader, _tagger);
         _sender = new MemeSender(Context, _config.Meme);
 
@@ -122,6 +128,11 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         if (_queue is not null)
             await _queue.DisposeAsync().ConfigureAwait(false);
         _queue = null;
+
+        _chatTool?.Dispose();
+        _chatTool = null;
+        _saveChatTool?.Dispose();
+        _saveChatTool = null;
 
         _lifetime.Cancel();
         _downloader?.Dispose();
@@ -291,7 +302,7 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
             return;
         }
 
-        if (_tagger is null || !_tagger.IsConfigured)
+        if (_tagger is null || (!_tagger.IsConfigured && !await EnsureAiChatTaggerAsync(CancellationToken.None).ConfigureAwait(false)))
         {
             await ReplyTextAsync(message, "AI 标注不可用：请开启 AI 标注，并安装 AI 聊天插件借用它的模型，或在“表情库设置”里填写自己的 AI 接口地址和模型。").ConfigureAwait(false);
             return;
@@ -322,27 +333,43 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         _ = Task.Run(async () =>
         {
             var updated = 0;
+            var removed = 0;
+            var failed = 0;
             try
             {
                 foreach (var item in items)
                 {
                     if (_lifetime.IsCancellationRequested) break;
-                    var path = Path.Combine(store.FilesDirectory, item.FileName);
-                    if (!File.Exists(path)) continue;
+                    try
+                    {
+                        var path = Path.Combine(store.FilesDirectory, item.FileName);
+                        BotLog.Info($"Meme 重新标注处理 id={item.Id[..8]} 文件={item.FileName}");
+                        if (!File.Exists(path)) { failed++; BotLog.Warning($"Meme 重新标注跳过 id={item.Id[..8]}：文件不存在"); continue; }
 
-                    var data = await File.ReadAllBytesAsync(path, _lifetime.Token).ConfigureAwait(false);
-                    var ai = await tagger.TagAsync(data, item.Mime,
-                        $"{item.Caption} {string.Join(" ", item.Tags)}", _lifetime.Token).ConfigureAwait(false);
-                    if (ai is null) continue;
+                        var data = await File.ReadAllBytesAsync(path, _lifetime.Token).ConfigureAwait(false);
+                        var ai = await tagger.TagAsync(data, item.Mime,
+                            $"{item.Caption} {string.Join(" ", item.Tags)}", _lifetime.Token).ConfigureAwait(false);
+                        if (ai is null) { failed++; continue; }
+                        if (_config.Meme.AiFilterNonMeme && ai.Kind is "screenshot" or "photo" or "other")
+                        {
+                            if (await store.QuarantineAsync(item.Id, _lifetime.Token).ConfigureAwait(false)) removed++;
+                            else failed++;
+                            BotLog.Info($"Meme 重新标注清理 id={item.Id[..8]} kind={ai.Kind}：移出表情库，原图保存在 rejected 目录");
+                            continue;
+                        }
 
-                    var caption = string.IsNullOrWhiteSpace(ai.Caption) ? item.Caption : ai.Caption;
-                    var tags = ai.Tags.Count > 0 ? ai.Tags : item.Tags;
-                    var emotions = ai.Emotions.Count > 0 ? ai.Emotions : item.Emotions;
-                    if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, ai.Kind, _lifetime.Token).ConfigureAwait(false))
-                        updated++;
+                        var caption = string.IsNullOrWhiteSpace(ai.Caption) ? item.Caption : ai.Caption;
+                        var tags = ai.Tags.Count > 0 ? ai.Tags : item.Tags;
+                        var emotions = ai.Emotions.Count > 0 ? ai.Emotions : item.Emotions;
+                        if (await store.UpdateMetadataAsync(item.Id, caption, tags, emotions, ai.Kind, _lifetime.Token).ConfigureAwait(false))
+                            updated++;
+                        else { failed++; BotLog.Warning($"Meme 重新标注写入失败 id={item.Id[..8]}：条目已不存在"); }
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { failed++; BotLog.Warning($"Meme 重新标注失败 id={item.Id[..8]}：{ex.GetType().Name}: {ex.Message}"); }
                 }
 
-                BotLog.Info($"Meme AI 重新标注完成：{updated}/{items.Count} 张");
+                BotLog.Info($"Meme AI 重新标注完成：更新 {updated}，清理 {removed}，失败/跳过 {failed}，总计 {items.Count} 张");
             }
             catch (OperationCanceledException)
             {
@@ -361,11 +388,11 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
 
     private static bool NeedsAiTags(MemeItem item)
     {
-        if (item.Caption is "表情包" or "[图片]" or "[动画表情]" or "[image]" or "[sticker]")
+        if (item.Caption is "表情包" or "[图片]" or "[动态表情]" or "[动画表情]" or "[image]" or "[sticker]")
             return true;
         var generic = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "[图片]", "[动画表情]", "[image]", "[sticker]", "表情", "图片",
+            "[图片]", "[动画表情]", "[动态表情]", "[image]", "[sticker]", "表情", "图片",
         };
         return item.Tags.Count == 0 || item.Tags.All(generic.Contains);
     }
@@ -608,39 +635,76 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
 
     private const string ChatToolName = "send_meme";
 
-    /// <summary>借用 AI 聊天插件的识图模型做标注；AI 聊天插件不在时返回 null。</summary>
-    private async Task<string?> TagWithAiChatModelAsync(string prompt, byte[] image, string mime, string? model, CancellationToken cancellationToken)
+    /// <summary>Probe the AIChat named model service before advertising AI tagging.</summary>
+    private async Task<bool> EnsureAiChatTaggerAsync(CancellationToken cancellationToken)
     {
-        var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
-            [new ChatModelMessage("user", prompt, [new ChatModelImage(mime, Convert.ToBase64String(image))])],
-            model, NeedsVision: true, MaxOutputTokens: 400, Temperature: 0), cancellationToken).ConfigureAwait(false);
-        return reply?.Text;
+        if (_tagger is null || !_config.Meme.AiTaggingEnabled ||
+            MemeAiTagger.UsesCustomEndpoint(_config.Meme) || _tagger.AiChat is not null)
+            return _tagger?.IsConfigured == true;
+
+        try
+        {
+            var models = await ChatModels.List.TryCallAsync(Context, cancellationToken).ConfigureAwait(false);
+            if (models is null) return false;
+            _tagger.AiChat = TagWithAiChatModelAsync;
+            return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            BotLog.Warning($"Meme AI 标注检查 AIChat 契约失败：{ex.Message}");
+            return false;
+        }
     }
 
-    /// <summary>按配置注册或注销聊天工具；说明随使用倾向变化，所以每次重新注册。</summary>
+    private async Task<string?> TagWithAiChatModelAsync(string prompt, byte[] image, string mime, string? model, CancellationToken cancellationToken)
+    {
+        var models = await ChatModels.List.TryCallAsync(Context, cancellationToken).ConfigureAwait(false);
+        string? path = null;
+        try
+        {
+            ChatModelImage input;
+            if (models?.SupportsImageFiles == true)
+            {
+                var temporary = Context.CreateTempDirectory(TimeSpan.FromMinutes(10));
+                path = Path.Combine(temporary.Path, "tagging-image");
+                await File.WriteAllBytesAsync(path, image, cancellationToken).ConfigureAwait(false);
+                input = new ChatModelImage(mime, FilePath: path);
+            }
+            else input = new ChatModelImage(mime, Convert.ToBase64String(image));
+            var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
+                [new ChatModelMessage("user", prompt, [input])],
+                model, NeedsVision: true, MaxOutputTokens: 2048, Temperature: 0), cancellationToken).ConfigureAwait(false);
+            return reply?.Text;
+        }
+        finally
+        {
+            if (path is not null)
+            {
+                try { File.Delete(path); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+    }
+
+    /// <summary>注册表情工具；是否调用由 AIChat 的模型和人设决定。</summary>
     private void UpdateChatTool()
     {
         _chatTool?.Dispose();
         _chatTool = null;
+        _saveChatTool?.Dispose();
+        _saveChatTool = null;
         if (!_config.Meme.Enabled || !_config.Meme.AiToolEnabled) return;
-        _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor(_config.Meme.AiToolPolicy));
+        _chatTool = ChatTools.Tools.Provide(Context, ChatToolName, HandleChatToolAsync, ChatToolInfoFor());
+        _saveChatTool = ChatTools.Tools.Provide(Context, "save_meme", HandleSaveMemeAsync, SaveToolInfo());
     }
 
-    internal static ChatToolInfo ChatToolInfoFor(string policy)
+    internal static ChatToolInfo ChatToolInfoFor()
     {
-        var auto = string.Equals(policy, "auto", StringComparison.OrdinalIgnoreCase);
         return new ChatToolInfo(
-            auto
-                ? "Select one suitable meme from the local meme library for the current chat. Use proactively in casual conversation, banter, teasing, or emotional replies; do not use for serious answers. The meme is sent after your reply."
-                : "Select one suitable meme from the local meme library, only when the user explicitly asks for a meme or sticker. The meme is sent after your reply.",
+            "Select one local meme matching the supplied keyword and/or emotion and send it after the current reply. " +
+            "Returns unavailable when no matching meme exists or the conversation is in cooldown.",
             PluginJsonSchema.For<SendMemeToolArgs>(),
-            auto
-                ? "你有一个本地表情库。回复别人时，如果语气轻松、在接梗、吐槽、卖萌、打招呼或表达情绪，应主动调用 send_meme 配一张表情，" +
-                  "不需要等用户明确要求。严肃回答、求助、工作/学习问题不要发；每次回复最多一张，不要连续发。" +
-                  "调用后最终回复只写一句很短的点评或接梗，不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。"
-                : "你有一个本地表情库。只有在用户明确要求发表情、斗图或使用表情时才调用 send_meme；" +
-                  "用户没有明确要求时不要主动发。每次回复最多一张，不要连续发。调用后最终回复只写一句很短的点评或接梗，" +
-                  "不要描述图片内容、标签或 URL；如果工具返回没有合适表情，就正常用文字回复。",
             MaxCallsPerTurn: 1);
     }
 
@@ -656,10 +720,10 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         var selection = await SelectAsync(new MemeQuery(query, emotion, call.Context.ChannelId, call.Context.SenderId), cancellationToken)
             .ConfigureAwait(false);
         if (selection is null)
-            return new ChatToolResult("No suitable meme is available right now, or this conversation is in cooldown. Reply with text instead.");
+            return new ChatToolResult("No matching meme is available, or this conversation is in cooldown. No image has been queued.");
 
         var content = $"Selected a meme ({selection.Caption}; tags: {string.Join(", ", selection.Tags)}). " +
-                      "It is sent after your reply. Keep the reply to one short sentence; do not describe the image.";
+                      "It is queued for sending after your reply.";
         return new ChatToolResult(content,
             new ChatAfterReply(ChatToolName, PluginJson.ToNode(new SendMemeArgs(selection.Id, args?.Caption))!.AsObject()));
     }
@@ -670,8 +734,9 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
     private async Task<ChatAfterReplyResult> HandleAfterReplyAsync(ChatAfterReplyCall call, CancellationToken cancellationToken)
     {
         var args = call.Arguments.As<SendMemeArgs>();
-        var selection = args is null ? null : _store?.GetById(args.Id);
-        if (selection is null) return new ChatAfterReplyResult(false, "未找到该表情");
+        var selection = string.IsNullOrWhiteSpace(args?.Id) ? null : _store?.GetById(args.Id);
+        if (selection is null || !string.Equals(selection.Id, args!.Id, StringComparison.Ordinal))
+            return new ChatAfterReplyResult(false, "未找到该表情");
 
         var caption = call.Reply.TextSent ? "" : args!.Caption?.Trim() ?? "";
         var context = call.Context;
@@ -689,27 +754,30 @@ public sealed partial class MemePlugin : PluginBase<MemeConfig>, IMemeService
         var key = string.IsNullOrWhiteSpace(query.ChannelId) ? "global" : query.ChannelId;
         if (IsBlocked(key)) return null;
 
-        var candidates = _store.Search(query.Query, query.Emotion, Math.Max(1, query.Limit));
-        if (candidates.Count == 0 && (!string.IsNullOrWhiteSpace(query.Query) ||
-                                      !string.IsNullOrWhiteSpace(query.Emotion)))
-        {
-            // 模型/用户给的关键词未必命中本地标签；库里非空时退化为随机可用表情，
-            // 避免“明明有图却回复没货”。
-            candidates = _store.Search("", null, Math.Max(1, query.Limit));
-        }
-
-        if (candidates.Count == 0) return null;
-
+        string[] recentIds;
         lock (_recent)
+            recentIds = _recent.TryGetValue(key, out var recent) ? recent.ToArray() : [];
+
+        var excluded = recentIds.ToHashSet(StringComparer.Ordinal);
+        var candidates = SearchAvailable(excluded);
+        if (candidates.Count == 0 && recentIds.Length > 0)
         {
-            if (_recent.TryGetValue(key, out var recent) && recent.Count > 0)
-            {
-                var filtered = candidates.Where(c => !recent.Contains(c.Id)).ToList();
-                if (filtered.Count > 0) candidates = filtered;
-            }
+            // 小库可能全部落在最近 30 张内；开启下一轮，仍避免连续发送上一张。
+            excluded = new HashSet<string>(StringComparer.Ordinal) { recentIds[^1] };
+            candidates = SearchAvailable(excluded);
         }
 
+        // 库里只有一张图片时仍允许发送。
+        if (candidates.Count == 0)
+            candidates = SearchAvailable(null);
+        if (candidates.Count == 0) return null;
         return candidates[Random.Shared.Next(candidates.Count)];
+
+        IReadOnlyList<MemeSelection> SearchAvailable(IReadOnlySet<string>? excludedIds)
+        {
+            var limit = Math.Max(1, query.Limit);
+            return _store.Search(query.Query, query.Emotion, limit, excludedIds);
+        }
     }
 
     public async Task<MemeSendResult> SendAsync(

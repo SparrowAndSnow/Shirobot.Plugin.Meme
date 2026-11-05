@@ -36,7 +36,8 @@ internal static partial class MemeTagging
     public static List<string> ExtractTags(string text, string? summary, MarketFaceInfo? marketFace)
     {
         var result = new List<string>();
-        Add(result, summary);
+        if (summary is not ("[图片]" or "[表情]" or "[动画表情]" or "[动态表情]" or "[image]" or "[sticker]"))
+            Add(result, summary);
         if (marketFace is not null)
         {
             Add(result, marketFace.Summary);
@@ -69,7 +70,7 @@ internal static partial class MemeTagging
     {
         var value = !string.IsNullOrWhiteSpace(summary) ? summary : text;
         value = (value ?? "").Trim();
-        if (value.Length == 0 || value is "[图片]" or "[表情]" or "[image]" or "[sticker]")
+        if (value.Length == 0 || value is "[图片]" or "[表情]" or "[动画表情]" or "[动态表情]" or "[image]" or "[sticker]")
             return "表情包";
         return value.Length <= maxChars ? value : value[..maxChars];
     }

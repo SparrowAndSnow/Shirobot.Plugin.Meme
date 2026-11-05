@@ -124,7 +124,8 @@ internal sealed class MemeStore : IDisposable
         MemeSource source,
         MarketFaceInfo? marketFace,
         string? kind = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        MemeFingerprint? precomputedFingerprint = null)
     {
         if (data.Length == 0 || data.Length > Config.MaxBytes)
             return null;
@@ -145,7 +146,7 @@ internal sealed class MemeStore : IDisposable
             MemeFingerprint? fingerprint = null;
             if (Config.PerceptualThreshold > 0)
             {
-                fingerprint = MemePerceptualHash.Compute(data);
+                fingerprint = precomputedFingerprint ?? MemePerceptualHash.Compute(data);
                 if (fingerprint is { } candidate)
                 {
                     lock (_sync)
@@ -210,7 +211,8 @@ internal sealed class MemeStore : IDisposable
         }
     }
 
-    public IReadOnlyList<MemeSelection> Search(string? query, string? emotion, int limit)
+    public IReadOnlyList<MemeSelection> Search(string? query, string? emotion, int limit,
+        IReadOnlySet<string>? excludedIds = null)
     {
         List<MemeItem> snapshot;
         lock (_sync)
@@ -222,6 +224,9 @@ internal sealed class MemeStore : IDisposable
         var scored = new List<(MemeItem Item, double Score)>();
         foreach (var item in snapshot)
         {
+            // 在截断候选集前排除最近发过的图片，避免候选窗口被旧图占满。
+            if (excludedIds?.Contains(item.Id) == true)
+                continue;
             if (normalizedEmotion.Length > 0 &&
                 !item.Emotions.Any(e => string.Equals(e, normalizedEmotion, StringComparison.OrdinalIgnoreCase)))
                 continue;
@@ -237,11 +242,10 @@ internal sealed class MemeStore : IDisposable
                 if (exactTag) score += 6;
                 if (partialTag) score += 3;
                 if (inCaption) score += 2;
-                score += item.UseCount * 0.01;
             }
             else
             {
-                score = 1 + item.UseCount * 0.01;
+                score = 1;
             }
 
             scored.Add((item, score));
@@ -256,7 +260,11 @@ internal sealed class MemeStore : IDisposable
     }
 
     public MemeItem? FindExisting(byte[] data, MarketFaceInfo? marketFace)
+        => FindExisting(data, marketFace, out _);
+
+    public MemeItem? FindExisting(byte[] data, MarketFaceInfo? marketFace, out MemeFingerprint? fingerprint)
     {
+        fingerprint = null;
         if (data.Length == 0) return null;
         var hash = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
         lock (_sync)
@@ -267,7 +275,7 @@ internal sealed class MemeStore : IDisposable
         }
 
         if (Config.PerceptualThreshold <= 0) return null;
-        var fingerprint = MemePerceptualHash.Compute(data);
+        fingerprint = MemePerceptualHash.Compute(data);
         if (fingerprint is not { } candidate) return null;
         lock (_sync)
         {
@@ -429,6 +437,19 @@ internal sealed class MemeStore : IDisposable
         {
             _gate.Release();
         }
+    }
+
+    internal async Task<bool> QuarantineAsync(string id, CancellationToken ct = default)
+    {
+        var item = GetItems().FirstOrDefault(item => item.Id == id);
+        if (item is null) return false;
+        var rejected = Path.Combine(Path.GetDirectoryName(FilesDirectory)!, "rejected");
+        Directory.CreateDirectory(rejected);
+        // Preserve the original before removing it from the searchable library.
+        var source = Path.Combine(FilesDirectory, item.FileName);
+        var destination = Path.Combine(rejected, item.FileName);
+        await File.WriteAllBytesAsync(destination, await File.ReadAllBytesAsync(source, ct).ConfigureAwait(false), ct).ConfigureAwait(false);
+        return await RemoveAsync(id, ct).ConfigureAwait(false);
     }
 
     public async Task<bool> RemoveAsync(string id, CancellationToken cancellationToken = default)
