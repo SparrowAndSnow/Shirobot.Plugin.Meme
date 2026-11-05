@@ -36,9 +36,13 @@ public sealed partial class MemePlugin
                 Ui.Select("emotion", "情绪", [("happy", "开心"), ("sad", "难过"), ("angry", "生气"),
                     ("confused", "困惑"), ("shy", "害羞"), ("daily", "日常")])),
             Ui.Gallery(items, item => new UiCard(item.Id,
-                string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption,
-                Description: string.Join(" · ", item.Emotions), Image: item.Id, Tags: item.Tags.ToArray(),
-                Meta: $"使用 {item.UseCount} 次 · {item.Bytes / 1024d:F1} KB"))
+                string.IsNullOrWhiteSpace(item.Caption) ? "表情" : item.Caption)
+            {
+                Description = string.Join(" · ", item.Emotions),
+                Image = item.Id,
+                Tags = item.Tags.ToArray(),
+                Meta = $"使用 {item.UseCount} 次 · {item.Bytes / 1024d:F1} KB"
+            })
                 .Action("delete", "删除", async (item, e, ct) =>
                     await Library().RemoveAsync(item.Id, ct).ConfigureAwait(false)
                         ? DashboardResult.Done("已删除。") : DashboardResult.Error("未找到该表情，请刷新。"),

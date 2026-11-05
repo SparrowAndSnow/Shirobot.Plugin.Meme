@@ -69,7 +69,7 @@ public sealed class MemeSection
     [ConfigField("表情文件存放目录，相对插件目录。", Label = "存储目录", Group = "storage", GroupLabel = "存储与下载", GroupOrder = 20)]
     public string LibraryDir { get; set; } = "memes";
 
-    [ConfigField("向 AI 聊天等插件提供 send_meme 工具（需要宿主 1.0.3）；关闭后它们不会再发表情。", Label = "提供 AI 表情工具", Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45, GroupDescription = "给 AI 聊天插件使用的表情工具。")]
+    [ConfigField("向 AI 聊天等插件提供 send_meme 工具（需要宿主 1.0.2）；关闭后它们不会再发表情。", Label = "提供 AI 表情工具", Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45, GroupDescription = "给 AI 聊天插件使用的表情工具。")]
     public bool AiToolEnabled { get; set; } = true;
 
     [ConfigField("explicit：只在用户明确要求发表情时使用；auto：轻松聊天时主动配表情。", Label = "使用倾向", Options = new[] { "explicit", "auto" }, Group = "chat_tool", GroupLabel = "AI 聊天工具", GroupOrder = 45)]
